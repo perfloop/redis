@@ -237,8 +237,6 @@ def main():
     if arguments.check:
         print("iothread reentrant Lua liveness check: PASS attempt=%d" % attempt)
     else:
-        # The metric form preserves the command-line API as a boolean success
-        # sentinel; it no longer reports a scheduling-sensitive duration.
         print(json.dumps({"metric": "reentrant_progress_us", "value": 1}))
 
 
