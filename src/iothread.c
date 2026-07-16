@@ -555,8 +555,8 @@ int processClientsFromIOThread(IOThread *t) {
     pthread_mutex_lock(&mainThreadPendingClientsMutexes[t->id]);
     listJoin(mainThreadProcessingClients[t->id], mainThreadPendingClients[t->id]);
     pthread_mutex_unlock(&mainThreadPendingClientsMutexes[t->id]);
-    size_t processed = listLength(mainThreadProcessingClients[t->id]);
-    if (processed == 0) return 0;
+    int processed = 0;
+    if (listLength(mainThreadProcessingClients[t->id]) == 0) return 0;
 
     int prefetch_clients = 0;
     /* We may call processClientsFromIOThread reentrantly, so we need to
@@ -565,7 +565,11 @@ int processClientsFromIOThread(IOThread *t) {
     resetCommandsBatch();
 
     listNode *node = NULL;
-    while (listLength(mainThreadProcessingClients[t->id])) {
+    /* Process one handoff batch per invocation. Leaving the rest in the
+     * processing list lets other IO-thread notifier callbacks run before
+     * beforeSleep() continues this lane without blocking. */
+    while (listLength(mainThreadProcessingClients[t->id]) &&
+           processed < IO_THREAD_MAX_PENDING_CLIENTS / 4) {
         if (prefetch_clients <= 0) {
             /* Reset the prefetching batch if we have processed all clients. */
             resetCommandsBatch();
@@ -579,6 +583,7 @@ int processClientsFromIOThread(IOThread *t) {
         if (node) zfree(node);
         node = listFirst(mainThreadProcessingClients[t->id]);
         listUnlinkNode(mainThreadProcessingClients[t->id], node);
+        processed++;
         client *c = listNodeValue(node);
 
         /* Make sure the client is neither readable nor writable in io thread to
