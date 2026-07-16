@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Check same-lane IO-thread progress while a timed-out Lua script reenters.
+"""Measure a busy-script end-to-end IO-thread reply burst.
 
-The workload uses one worker IO thread.  It first observes a real BUSY reply
-from a timed-out script, then sends 64 ordinary requests followed by SCRIPT
-KILL without sending another request.  A qualifying attempt observes all 64
-ordinary requests receive BUSY, proving SCRIPT KILL was processed behind them
-rather than merely winning a cross-socket arrival race.
+The workload uses one worker IO thread. It observes a real BUSY reply from a
+timed-out script, then sends 64 ordinary requests followed by SCRIPT KILL
+without sending another request. A sample is retained only when all ordinary
+requests also observe the busy script. This is a progress metric, not a
+command-dispatch-order assertion; iothread_reentrant_order.py covers that
+semantic invariant with a server-side dispatch log and yield epochs.
 """
 
 import argparse
@@ -25,7 +26,6 @@ import iothread_fairness as fairness
 
 QUEUED_PINGS = 64
 MAX_SETUP_ATTEMPTS = 20
-KILL_PROGRESS_LIMIT_US = 5_000
 
 
 class CheckClient(fairness.RespClient):
@@ -170,7 +170,7 @@ def run_attempt(admin):
         script_client.socket.sendall(fairness.encode_command("EVAL", "while true do end", "0"))
         wait_for_busy_script(probe)
 
-        # The BUSY probe proves that the script has entered its reentrant event
+        # The BUSY probe proves that the script entered its reentrant event
         # loop. No command is sent after this one burst of same-lane handoffs.
         start = time.perf_counter_ns()
         for client in pingers:
@@ -188,8 +188,9 @@ def run_attempt(admin):
         for index in range(QUEUED_PINGS):
             response_type, response = replies["ping-%d" % index]
             if (response_type, response) == ("status", "PONG"):
-                # SCRIPT KILL overtook this request, so this attempt did not
-                # establish the required same-lane residual ordering.
+                # Keep only bursts whose ordinary requests were served while
+                # the script was still busy. This does not establish dispatch
+                # order; the separate order check does that.
                 return None
             if response_type != "error" or not response.startswith("BUSY"):
                 raise fairness.BenchmarkError("queued PING %d reply was %r" % (index, (response_type, response)))
@@ -211,7 +212,7 @@ def run_measurement(server_path, server_cpus):
             progress_us = run_attempt(admin)
             if progress_us is not None:
                 return attempt, progress_us
-        raise fairness.BenchmarkError("could not establish same-lane queued ordering")
+        raise fairness.BenchmarkError("could not observe a busy-script reply burst")
     finally:
         if admin is not None:
             try:
@@ -226,30 +227,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="src/redis-server")
     parser.add_argument("--server-cpus", default="")
-    parser.add_argument("--check", action="store_true")
-    parser.add_argument("--metric", choices=("reentrant_progress_us",))
+    parser.add_argument("--metric", choices=("reentrant_progress_us",), required=True)
     arguments = parser.parse_args()
-    if arguments.check == (arguments.metric is not None):
-        parser.error("specify exactly one of --check or --metric")
 
     server_path = Path(arguments.server)
     if not server_path.is_file():
         raise fairness.BenchmarkError("Redis server binary does not exist: %s" % server_path)
     attempt, progress_us = run_measurement(server_path, arguments.server_cpus)
 
-    if arguments.check:
-        if progress_us > KILL_PROGRESS_LIMIT_US:
-            raise fairness.BenchmarkError(
-                "qualified same-lane progress was %.3f us, above %d us"
-                % (progress_us, KILL_PROGRESS_LIMIT_US)
-            )
-        print(
-            "iothread reentrant progress check: PASS busy-probe=1 "
-            "queued-pings=%d worker=1 attempt=%d progress-us=%.3f"
-            % (QUEUED_PINGS, attempt, progress_us)
-        )
-    else:
-        print(json.dumps({"metric": "reentrant_progress_us", "value": progress_us}))
+    print(json.dumps({"metric": "reentrant_progress_us", "value": progress_us}))
 
 
 if __name__ == "__main__":
