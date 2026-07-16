@@ -572,7 +572,7 @@ int processClientsFromIOThread(IOThread *t) {
      * full-drain behavior rather than strand control requests behind residual
      * clients. */
     while (listLength(mainThreadProcessingClients[t->id]) &&
-           (processed < IO_THREAD_MAX_PENDING_CLIENTS / 4 || ProcessingEventsWhileBlocked)) {
+           (processed < IO_THREAD_MAX_PENDING_CLIENTS / 2 || ProcessingEventsWhileBlocked)) {
         if (prefetch_clients <= 0) {
             /* Reset the prefetching batch if we have processed all clients. */
             resetCommandsBatch();
