@@ -357,8 +357,7 @@ def run_reentrant_progress_check(server_path, server_cpus):
         str(Path(__file__).with_name("iothread_reentrant_progress.py").resolve()),
         "--server",
         str(server_path.resolve()),
-        "--metric",
-        "reentrant_progress_us",
+        "--check",
     ]
     if server_cpus:
         command.extend(("--server-cpus", server_cpus))

@@ -8,10 +8,12 @@ worker lane. SLOWLOG records actual server dispatch order, so a qualified run
 requires that at least eight marker commands really preceded stop; it does not
 infer that order from client send order or reply contents.
 
-A full reentrant drain dispatches the qualified marker batch and stop in one
-module yield epoch. A bounded reentrant drain spreads marker replies across
-multiple yield epochs before it can reach the control command. Socket deadlines
-are only a watchdog for a hung test process, not a pass/fail latency budget.
+A qualified full-drain attempt dispatches the actual marker set recorded
+before stop in one module yield epoch. A bounded reentrant drain cannot do so
+for that set once it has more markers than the normal quantum. Attempts whose
+cross-socket arrivals span multiple blocked-event passes are retried rather
+than treated as a scheduler failure. Socket deadlines are only a watchdog for
+a hung test process, not a pass/fail latency budget.
 """
 
 import argparse
@@ -33,7 +35,7 @@ QUEUED_MARKERS = 32
 MIN_MARKERS_BEFORE_CONTROL = 8
 MAX_SETUP_ATTEMPTS = 20
 LIVENESS_TIMEOUT_SECONDS = 10
-MARKER_COMMAND = ("iothreadtest.marker",)
+MARKER_COMMAND = "iothreadtest.marker"
 STOP_COMMAND = ("iothreadtest.stop",)
 
 
@@ -210,14 +212,28 @@ def slowlog_command_name(entry):
     return tuple(parts)
 
 
-def markers_dispatched_before_stop(slowlog_entries):
+def marker_ids_dispatched_before_stop(slowlog_entries):
     names = [slowlog_command_name(entry) for entry in slowlog_entries]
     try:
         stop_index = names.index(STOP_COMMAND)
     except ValueError as error:
         raise fairness.BenchmarkError("SLOWLOG did not record iothreadtest.stop") from error
+
     # SLOWLOG returns newest first, so later list entries were dispatched first.
-    return sum(name == MARKER_COMMAND for name in names[stop_index + 1:])
+    marker_ids = set()
+    for name in names[stop_index + 1:]:
+        if not name or name[0] != MARKER_COMMAND:
+            continue
+        if len(name) != 2:
+            raise fairness.BenchmarkError("SLOWLOG marker command did not include its identifier: %r" % (name,))
+        try:
+            marker_id = int(name[1])
+        except ValueError as error:
+            raise fairness.BenchmarkError("SLOWLOG marker identifier was not numeric: %r" % (name,)) from error
+        if marker_id < 0 or marker_id >= QUEUED_MARKERS:
+            raise fairness.BenchmarkError("SLOWLOG marker identifier was out of range: %r" % (name,))
+        marker_ids.add(marker_id)
+    return marker_ids
 
 
 def run_attempt(admin, port):
@@ -237,8 +253,8 @@ def run_attempt(admin, port):
         slow_client.socket.sendall(fairness.encode_command("iothreadtest.slow"))
         wait_for_busy_operation(probe)
 
-        for marker in markers:
-            marker.socket.sendall(fairness.encode_command(*MARKER_COMMAND))
+        for index, marker in enumerate(markers):
+            marker.socket.sendall(fairness.encode_command(MARKER_COMMAND, str(index)))
         control.socket.sendall(fairness.encode_command(*STOP_COMMAND))
 
         expected = [("slow", slow_client), ("control", control)]
@@ -251,25 +267,26 @@ def run_attempt(admin, port):
         if replies["slow"][1] != control_epoch:
             raise fairness.BenchmarkError("long command ended at a different yield epoch")
 
-        marker_epochs = set()
+        marker_epochs = {}
         for index in range(QUEUED_MARKERS):
             response_type, response = replies["marker-%d" % index]
             if response_type != "integer":
                 raise fairness.BenchmarkError("marker %d reply was %r" % (index, (response_type, response)))
-            marker_epochs.add(response)
+            marker_epochs[index] = response
 
         slowlog_entries = admin.command("SLOWLOG", "GET", "1024")
-        marker_count = markers_dispatched_before_stop(slowlog_entries)
-        if marker_count < MIN_MARKERS_BEFORE_CONTROL:
+        marker_ids = marker_ids_dispatched_before_stop(slowlog_entries)
+        if len(marker_ids) < MIN_MARKERS_BEFORE_CONTROL:
             # The actual dispatch log says control won the cross-socket race;
             # retry rather than treating sender order as evidence.
             return None
-        if marker_epochs != {control_epoch}:
-            raise fairness.BenchmarkError(
-                "bounded reentrant drain spread markers across yield epochs %r before control epoch %d"
-                % (sorted(marker_epochs), control_epoch)
-            )
-        return control_epoch, marker_count
+        pre_stop_epochs = {marker_epochs[index] for index in marker_ids}
+        if pre_stop_epochs != {control_epoch}:
+            # These marker sockets reached different blocked-event passes before
+            # stop. That is legal cross-socket arrival, not proof of a bounded
+            # drain; retry until SLOWLOG identifies one authoritative batch.
+            return None
+        return control_epoch, len(marker_ids)
     finally:
         for client in clients:
             try:

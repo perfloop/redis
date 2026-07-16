@@ -30,7 +30,7 @@ static int slowCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
 static int markerCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
-    if (argc != 1) {
+    if (argc != 2) {
         return RedisModule_WrongArity(ctx);
     }
     RedisModule_ReplyWithLongLong(ctx, yield_epoch);

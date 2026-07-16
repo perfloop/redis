@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -13,6 +14,12 @@ import iothread_fairness as fairness
 BULK_CLIENTS = 24
 BULK_PIPELINE = 800
 ROUNDS = 100
+
+EXPECTED_METRICS = {
+    "below_quantum_short_ping_p99_us": "short_ping_p99_us",
+    "mixed_bulk_ops_per_sec": "bulk_ops_per_sec",
+    "one_lane_bulk_ops_per_sec": "bulk_ops_per_sec",
+}
 
 
 def run_one_lane_bulk_throughput(admin):
@@ -101,17 +108,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="src/redis-server")
     parser.add_argument("--server-cpus", default="")
-    parser.add_argument(
-        "--metric",
-        choices=(
-            "mixed_bulk_ops_per_sec",
-            "one_lane_bulk_ops_per_sec",
-            "below_quantum_short_ping_p99_us",
-        ),
-        required=True,
-    )
+    parser.add_argument("--metric", choices=tuple(EXPECTED_METRICS), required=True)
     arguments = parser.parse_args()
     metric, value = run_metric(arguments)
+    if metric != EXPECTED_METRICS[arguments.metric]:
+        raise fairness.BenchmarkError(
+            "guard selector %s emitted %s instead of %s"
+            % (arguments.metric, metric, EXPECTED_METRICS[arguments.metric])
+        )
+    if not math.isfinite(value) or value <= 0:
+        raise fairness.BenchmarkError("guard selector %s emitted an invalid value %r" % (arguments.metric, value))
     print(json.dumps({"metric": metric, "value": value}))
 
 
