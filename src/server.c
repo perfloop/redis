@@ -2067,8 +2067,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         if (!dont_sleep) {
             atomicSetWithSync(server.running, 0); /* Not running if going to sleep. */
             /* Try to process the clients from IO threads again, since before setting running
-             * to 0, some clients may be transferred without notification. */
-            processClientsOfAllIOThreads();
+             * to 0, some clients may be transferred without notification. A bounded handoff
+             * drain may leave a residual processing list, so keep the next loop nonblocking. */
+            if (processClientsOfAllIOThreads() > 0)
+                dont_sleep = 1;
         }
     }
 
