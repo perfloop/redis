@@ -565,10 +565,13 @@ int processClientsFromIOThread(IOThread *t) {
     resetCommandsBatch();
 
     listNode *node = NULL;
-    /* Process one handoff client per invocation. Leaving the rest in the
-     * processing list lets other IO-thread notifier callbacks run before
-     * beforeSleep() continues this lane without blocking. */
-    while (listLength(mainThreadProcessingClients[t->id]) && processed == 0) {
+    /* Process one handoff client per normal invocation. Leaving the rest in
+     * the processing list lets other IO-thread notifier callbacks run before
+     * beforeSleep() continues this lane without blocking. A reentrant blocked
+     * event loop stops on a no-event pass, so it must retain the old full-drain
+     * behavior rather than strand control requests behind residual clients. */
+    while (listLength(mainThreadProcessingClients[t->id]) &&
+           (processed == 0 || ProcessingEventsWhileBlocked)) {
         if (prefetch_clients <= 0) {
             /* Reset the prefetching batch if we have processed all clients. */
             resetCommandsBatch();
