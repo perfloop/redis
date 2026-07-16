@@ -4,7 +4,7 @@
 #include <unistd.h>
 
 /* Each command below is intentionally limited to the test module. The marker
- * and stop commands are allow-busy so they can run during slow_command's
+ * and stop commands are allow-busy so they can run during iothreadtest.slow's
  * event-loop yield. */
 static long long yield_epoch;
 static int stop_requested;

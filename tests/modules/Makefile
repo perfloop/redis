@@ -74,6 +74,7 @@ TEST_MODULES = \
     reply.so \
     cmdintrospection.so \
     eventloop.so \
+    iothreadtest.so \
     moduleconfigs.so \
     moduleconfigstwo.so \
     publish.so \

@@ -309,6 +309,30 @@ def run_workload(admin, rounds):
                 pass
 
 
+def run_reentrant_order_check(server_path, server_cpus):
+    """Run the blocked-event-loop regression after the fairness server exits."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    module_path = repo_root / "tests" / "modules" / "iothreadtest.so"
+    subprocess.run(
+        ("make", "-C", str(repo_root / "tests" / "modules"), "iothreadtest.so"),
+        cwd=repo_root,
+        check=True,
+    )
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("iothread_reentrant_order.py").resolve()),
+        "--server",
+        str(server_path.resolve()),
+        "--module",
+        str(module_path),
+        "--check",
+    ]
+    if server_cpus:
+        command.extend(("--server-cpus", server_cpus))
+    subprocess.run(command, cwd=repo_root, check=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="src/redis-server")
@@ -328,24 +352,15 @@ def main():
         raise BenchmarkError("Redis server binary does not exist: %s" % server_path)
 
     process = tempdir = admin = None
+    results = None
     try:
         process, tempdir, _logfile, admin = start_server(server_path, arguments.server_cpus)
         results = run_workload(admin, CHECK_ROUNDS if arguments.check else MEASURE_ROUNDS)
-        if arguments.check:
-            print(
-                "iothread fairness check: PASS "
-                "bulk-thread=%d short-thread=%d bulk-commands=%d short-samples=%d"
-                % (
-                    results["bulk_thread"],
-                    results["short_thread"],
-                    results["bulk_commands"],
-                    results["short_samples"],
-                )
-            )
-        elif arguments.metric == "short_ping_p99_us":
-            print(json.dumps({"metric": "short_ping_p99_us", "value": results["short_p99_us"]}))
-        else:
-            print(json.dumps({"metric": "bulk_ops_per_sec", "value": results["bulk_ops_per_sec"]}))
+        if not arguments.check:
+            if arguments.metric == "short_ping_p99_us":
+                print(json.dumps({"metric": "short_ping_p99_us", "value": results["short_p99_us"]}))
+            else:
+                print(json.dumps({"metric": "bulk_ops_per_sec", "value": results["bulk_ops_per_sec"]}))
     finally:
         if admin is not None:
             try:
@@ -354,6 +369,20 @@ def main():
                 pass
         if process is not None:
             stop_server(process, tempdir)
+
+    if arguments.check:
+        print(
+            "iothread fairness check: PASS "
+            "bulk-thread=%d short-thread=%d bulk-commands=%d short-samples=%d"
+            % (
+                results["bulk_thread"],
+                results["short_thread"],
+                results["bulk_commands"],
+                results["short_samples"],
+            ),
+            flush=True,
+        )
+        run_reentrant_order_check(server_path, arguments.server_cpus)
 
 
 if __name__ == "__main__":
