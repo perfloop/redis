@@ -565,11 +565,10 @@ int processClientsFromIOThread(IOThread *t) {
     resetCommandsBatch();
 
     listNode *node = NULL;
-    /* Process one handoff batch per invocation. Leaving the rest in the
+    /* Process one handoff client per invocation. Leaving the rest in the
      * processing list lets other IO-thread notifier callbacks run before
      * beforeSleep() continues this lane without blocking. */
-    while (listLength(mainThreadProcessingClients[t->id]) &&
-           processed < IO_THREAD_MAX_PENDING_CLIENTS / 4) {
+    while (listLength(mainThreadProcessingClients[t->id]) && processed == 0) {
         if (prefetch_clients <= 0) {
             /* Reset the prefetching batch if we have processed all clients. */
             resetCommandsBatch();
