@@ -254,15 +254,27 @@ def percentile(values, quantile):
     return sorted(values)[rank]
 
 
+def close_clients(clients):
+    for client in clients:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+def bulk_payloads(clients, key_prefix):
+    return {
+        client.client_id: encode_command("INCR", "%s:%d" % (key_prefix, index)) * BULK_PIPELINE
+        for index, client in enumerate(clients)
+    }
+
+
 def run_workload(admin, rounds):
     layout = create_lane_layout(admin)
     bulk_thread, short_thread, bulk_clients, short_client, fillers, retained_padding = layout
     all_clients = bulk_clients + fillers + retained_padding + [short_client]
     expected_values = {client.client_id: 0 for client in bulk_clients}
-    payloads = {
-        client.client_id: encode_command("INCR", "iothread-fairness:%d" % index) * BULK_PIPELINE
-        for index, client in enumerate(bulk_clients)
-    }
+    payloads = bulk_payloads(bulk_clients, "iothread-fairness")
     short_latencies_us = []
     try:
         # Warm the normal Redis command and I/O paths; warmup replies are also
@@ -272,7 +284,6 @@ def run_workload(admin, rounds):
             client.socket.sendall(payloads[client.client_id])
         drain_bulk_replies(bulk_clients, expected_values, BULK_PIPELINE)
 
-        start = time.perf_counter_ns()
         for _ in range(rounds):
             for client in bulk_clients:
                 client.socket.sendall(payloads[client.client_id])
@@ -284,7 +295,6 @@ def run_workload(admin, rounds):
             short_latencies_us.append((time.perf_counter_ns() - request_start) / 1000.0)
 
             drain_bulk_replies(bulk_clients, expected_values, BULK_PIPELINE)
-        elapsed_seconds = (time.perf_counter_ns() - start) / 1_000_000_000.0
 
         assignments = client_threads(admin)
         if assignments.get(short_client.client_id) != short_thread:
@@ -294,7 +304,6 @@ def run_workload(admin, rounds):
 
         return {
             "bulk_commands": rounds * BULK_CLIENTS * BULK_PIPELINE,
-            "bulk_ops_per_sec": rounds * BULK_CLIENTS * BULK_PIPELINE / elapsed_seconds,
             "bulk_thread": bulk_thread,
             "short_p50_us": percentile(short_latencies_us, 0.50),
             "short_p99_us": percentile(short_latencies_us, 0.99),
@@ -302,15 +311,62 @@ def run_workload(admin, rounds):
             "short_thread": short_thread,
         }
     finally:
-        for client in all_clients:
-            try:
-                client.close()
-            except OSError:
-                pass
+        close_clients(all_clients)
+
+
+def run_mixed_bulk_throughput(admin, rounds):
+    """Measure bulk completion before reading the concurrent PING reply."""
+
+    layout = create_lane_layout(admin)
+    bulk_thread, short_thread, bulk_clients, short_client, fillers, retained_padding = layout
+    all_clients = bulk_clients + fillers + retained_padding + [short_client]
+    expected_values = {client.client_id: 0 for client in bulk_clients}
+    payloads = bulk_payloads(bulk_clients, "iothread-fairness-bulk")
+    elapsed_ns = 0
+    try:
+        for client in bulk_clients:
+            client.socket.sendall(payloads[client.client_id])
+        drain_bulk_replies(bulk_clients, expected_values, BULK_PIPELINE)
+
+        for _ in range(rounds):
+            round_start = time.perf_counter_ns()
+            for client in bulk_clients:
+                client.socket.sendall(payloads[client.client_id])
+            short_client.socket.sendall(encode_command("PING"))
+            drain_bulk_replies(bulk_clients, expected_values, BULK_PIPELINE)
+            elapsed_ns += time.perf_counter_ns() - round_start
+            if short_client.read() != "PONG":
+                raise BenchmarkError("mixed-workload PING did not return PONG")
+
+        assignments = client_threads(admin)
+        if assignments.get(short_client.client_id) != short_thread:
+            raise BenchmarkError("short-request client moved to the bulk IO thread")
+        if any(assignments.get(client.client_id) != bulk_thread for client in bulk_clients):
+            raise BenchmarkError("a bulk client moved off the bulk IO thread")
+        return rounds * BULK_CLIENTS * BULK_PIPELINE / (elapsed_ns / 1_000_000_000.0)
+    finally:
+        close_clients(all_clients)
+
+
+def run_reentrant_progress_check(server_path, server_cpus):
+    """Exercise the Lua/SCRIPT KILL liveness path after the fairness server exits."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("iothread_reentrant_progress.py").resolve()),
+        "--server",
+        str(server_path.resolve()),
+        "--metric",
+        "reentrant_progress_us",
+    ]
+    if server_cpus:
+        command.extend(("--server-cpus", server_cpus))
+    subprocess.run(command, cwd=repo_root, check=True)
 
 
 def run_reentrant_order_check(server_path, server_cpus):
-    """Run the blocked-event-loop regression after the fairness server exits."""
+    """Run the blocked-event-loop dispatch-order regression after fairness exits."""
 
     repo_root = Path(__file__).resolve().parents[2]
     module_path = repo_root / "tests" / "modules" / "iothreadtest.so"
@@ -355,12 +411,13 @@ def main():
     results = None
     try:
         process, tempdir, _logfile, admin = start_server(server_path, arguments.server_cpus)
-        results = run_workload(admin, CHECK_ROUNDS if arguments.check else MEASURE_ROUNDS)
-        if not arguments.check:
-            if arguments.metric == "short_ping_p99_us":
+        if arguments.check or arguments.metric == "short_ping_p99_us":
+            results = run_workload(admin, CHECK_ROUNDS if arguments.check else MEASURE_ROUNDS)
+            if not arguments.check:
                 print(json.dumps({"metric": "short_ping_p99_us", "value": results["short_p99_us"]}))
-            else:
-                print(json.dumps({"metric": "bulk_ops_per_sec", "value": results["bulk_ops_per_sec"]}))
+        else:
+            value = run_mixed_bulk_throughput(admin, MEASURE_ROUNDS)
+            print(json.dumps({"metric": "bulk_ops_per_sec", "value": value}))
     finally:
         if admin is not None:
             try:
@@ -382,6 +439,7 @@ def main():
             ),
             flush=True,
         )
+        run_reentrant_progress_check(server_path, arguments.server_cpus)
         run_reentrant_order_check(server_path, arguments.server_cpus)
 
 

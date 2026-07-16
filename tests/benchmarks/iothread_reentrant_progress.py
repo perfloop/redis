@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Measure a busy-script end-to-end IO-thread reply burst.
+"""Verify Lua blocked-event IO-thread liveness and emit its progress sample.
 
 The workload uses one worker IO thread. It observes a real BUSY reply from a
 timed-out script, then sends 64 ordinary requests followed by SCRIPT KILL
 without sending another request. A sample is retained only when all ordinary
-requests also observe the busy script. This is a progress metric, not a
-command-dispatch-order assertion; iothread_reentrant_order.py covers that
-semantic invariant with a server-side dispatch log and yield epochs.
+requests also observe the busy script. iothread_fairness.py --check invokes
+this scenario as the Lua/SCRIPT KILL liveness guard; the separate
+reentrant-order test supplies the deterministic dispatch-order assertion.
 """
 
 import argparse

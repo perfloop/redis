@@ -15,66 +15,6 @@ BULK_PIPELINE = 800
 ROUNDS = 100
 
 
-def close_clients(clients):
-    for client in clients:
-        try:
-            client.close()
-        except OSError:
-            pass
-
-
-def bulk_payloads(clients):
-    return {
-        client.client_id: fairness.encode_command("INCR", "iothread-fairness-guard:%d" % index)
-        * BULK_PIPELINE
-        for index, client in enumerate(clients)
-    }
-
-
-def verify_assignments(admin, bulk_clients, bulk_thread, short_client=None, short_thread=None):
-    assignments = fairness.client_threads(admin)
-    if any(assignments.get(client.client_id) != bulk_thread for client in bulk_clients):
-        raise fairness.BenchmarkError("a bulk client moved off its expected IO thread")
-    if short_client is not None and assignments.get(short_client.client_id) != short_thread:
-        raise fairness.BenchmarkError("the short client moved onto the bulk IO thread")
-
-
-def run_mixed_bulk_throughput(admin):
-    """Measure only bulk completion while a distinct lane receives a PING.
-
-    The PING is sent in each round to preserve the mixed workload, but it is
-    deliberately read after the bulk completion timer stops.  Thus a faster
-    PING cannot raise this bulk-throughput result merely by shortening the
-    measured latency sample.
-    """
-
-    layout = fairness.create_lane_layout(admin)
-    bulk_thread, short_thread, bulk_clients, short_client, fillers, retained_padding = layout
-    all_clients = bulk_clients + fillers + retained_padding + [short_client]
-    expected_values = {client.client_id: 0 for client in bulk_clients}
-    payloads = bulk_payloads(bulk_clients)
-    elapsed_ns = 0
-    try:
-        for client in bulk_clients:
-            client.socket.sendall(payloads[client.client_id])
-        fairness.drain_bulk_replies(bulk_clients, expected_values, BULK_PIPELINE)
-
-        for _ in range(ROUNDS):
-            round_start = time.perf_counter_ns()
-            for client in bulk_clients:
-                client.socket.sendall(payloads[client.client_id])
-            short_client.socket.sendall(fairness.encode_command("PING"))
-            fairness.drain_bulk_replies(bulk_clients, expected_values, BULK_PIPELINE)
-            elapsed_ns += time.perf_counter_ns() - round_start
-            if short_client.read() != "PONG":
-                raise fairness.BenchmarkError("mixed-workload PING did not return PONG")
-
-        verify_assignments(admin, bulk_clients, bulk_thread, short_client, short_thread)
-        return ROUNDS * BULK_CLIENTS * BULK_PIPELINE / (elapsed_ns / 1_000_000_000.0)
-    finally:
-        close_clients(all_clients)
-
-
 def run_one_lane_bulk_throughput(admin):
     """Measure completion of the same bulk shape on one worker IO thread."""
 
@@ -95,7 +35,7 @@ def run_one_lane_bulk_throughput(admin):
             bulk_clients.append(client)
             expected_values[client.client_id] = 0
 
-        payloads = bulk_payloads(bulk_clients)
+        payloads = fairness.bulk_payloads(bulk_clients, "iothread-fairness-one-lane")
         for client in bulk_clients:
             client.socket.sendall(payloads[client.client_id])
         fairness.drain_bulk_replies(bulk_clients, expected_values, BULK_PIPELINE)
@@ -108,10 +48,12 @@ def run_one_lane_bulk_throughput(admin):
             fairness.drain_bulk_replies(bulk_clients, expected_values, BULK_PIPELINE)
             elapsed_ns += time.perf_counter_ns() - round_start
 
-        verify_assignments(admin, bulk_clients, bulk_thread)
+        assignments = fairness.client_threads(admin)
+        if any(assignments.get(client.client_id) != bulk_thread for client in bulk_clients):
+            raise fairness.BenchmarkError("a bulk client moved off its expected IO thread")
         return ROUNDS * BULK_CLIENTS * BULK_PIPELINE / (elapsed_ns / 1_000_000_000.0)
     finally:
-        close_clients(bulk_clients)
+        fairness.close_clients(bulk_clients)
 
 
 def start_guard_server(server_path, server_cpus, io_threads):
@@ -129,7 +71,7 @@ def run_metric(arguments):
         fairness.BULK_PIPELINE = BULK_PIPELINE
         process, tempdir, _logfile, admin = start_guard_server(server_path, arguments.server_cpus, 3)
         try:
-            value = run_mixed_bulk_throughput(admin)
+            value = fairness.run_mixed_bulk_throughput(admin, ROUNDS)
         finally:
             admin.close()
             fairness.stop_server(process, tempdir)
