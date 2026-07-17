@@ -3520,10 +3520,14 @@ int processCommandAndResetClient(client *c) {
 }
 
 
+static int processInputBufferAndLimit(client *c, int command_limit);
+
 /* This function will execute any fully parsed commands pending on
  * the client. Returns C_ERR if the client is no longer valid after executing
- * the command, and C_OK for all other cases. */
-int processPendingCommandAndInputBuffer(client *c) {
+ * the command, and C_OK for all other cases. A positive command_limit bounds
+ * this invocation; zero processes all available input. */
+int processPendingCommandAndInputBuffer(client *c, int command_limit) {
+    int commands_processed = 0;
     /* Notice, this code is also called from 'processUnblockedClients'.
      * But in case of a module blocked client (see RM_Call 'K' flag) we do not reach this code path.
      * So whenever we change the code here we need to consider if we need this change on module
@@ -3533,7 +3537,10 @@ int processPendingCommandAndInputBuffer(client *c) {
         if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
+        commands_processed++;
     }
+
+    if (command_limit && commands_processed >= command_limit) return C_OK;
 
     /* Now process client if it has more data in it's buffer.
      *
@@ -3541,7 +3548,8 @@ int processPendingCommandAndInputBuffer(client *c) {
      * it can always satisfy this condition, because its querybuf
      * contains data not applied. */
     if ((c->querybuf && sdslen(c->querybuf) > 0) || c->pending_cmds.ready_len > 0) {
-        return processInputBuffer(c);
+        int remaining = command_limit ? command_limit - commands_processed : 0;
+        return processInputBufferAndLimit(c, remaining);
     }
     return C_OK;
 }
@@ -3627,8 +3635,11 @@ int isClientReadErrorFatal(client *c) {
  * more query buffer to process, because we read more data from the socket
  * or because a client was blocked and later reactivated, so there could be
  * pending query buffer, already representing a full command, to process.
- * return C_ERR in case the client was freed during the processing */
-int processInputBuffer(client *c) {
+ * command_limit is zero for the normal unbounded path. Return C_ERR in case
+ * the client was freed during the processing. */
+static int processInputBufferAndLimit(client *c, int command_limit) {
+    int commands_processed = 0;
+
     atomicIncr(server.stat_total_client_process_input_buff_events, 1);
 
     /* Keep active-client window updates on main-thread paths only (here and
@@ -3795,6 +3806,8 @@ int processInputBuffer(client *c) {
                  * ASAP in that case. */
                 return C_ERR;
             }
+            commands_processed++;
+            if (command_limit && commands_processed >= command_limit) break;
         }
     }
 
@@ -3830,6 +3843,10 @@ int processInputBuffer(client *c) {
         updateClientMemUsageAndBucket(c);
 
     return C_OK;
+}
+
+int processInputBuffer(client *c) {
+    return processInputBufferAndLimit(c, 0);
 }
 
 void readQueryFromClient(connection *conn) {

@@ -13,6 +13,10 @@
 /* IO threads. */
 IOThread IOThreads[IO_THREADS_MAX_NUM];
 
+/* Bound a pipelined client before it yields to other clients in the same
+ * IO-thread handoff lane. */
+#define IO_THREAD_MAIN_THREAD_COMMAND_QUANTUM 64
+
 /* For main thread */
 static list *mainThreadPendingClientsToIOThreads[IO_THREADS_MAX_NUM]; /* Clients to IO threads */
 static list *mainThreadProcessingClients[IO_THREADS_MAX_NUM]; /* Clients in processing */
@@ -555,9 +559,9 @@ int processClientsFromIOThread(IOThread *t) {
     pthread_mutex_lock(&mainThreadPendingClientsMutexes[t->id]);
     listJoin(mainThreadProcessingClients[t->id], mainThreadPendingClients[t->id]);
     pthread_mutex_unlock(&mainThreadPendingClientsMutexes[t->id]);
-    size_t processed = listLength(mainThreadProcessingClients[t->id]);
-    if (processed == 0) return 0;
+    if (listLength(mainThreadProcessingClients[t->id]) == 0) return 0;
 
+    int processed = 0;
     int prefetch_clients = 0;
     /* We may call processClientsFromIOThread reentrantly, so we need to
      * reset the prefetching batch, besides, users may change the config
@@ -565,7 +569,10 @@ int processClientsFromIOThread(IOThread *t) {
     resetCommandsBatch();
 
     listNode *node = NULL;
-    while (listLength(mainThreadProcessingClients[t->id])) {
+    /* A requeued pipeline keeps this list nonempty, so bound the number of
+     * client slices before returning to the event loop. */
+    while (listLength(mainThreadProcessingClients[t->id]) &&
+           processed < IO_THREAD_MAX_PENDING_CLIENTS) {
         if (prefetch_clients <= 0) {
             /* Reset the prefetching batch if we have processed all clients. */
             resetCommandsBatch();
@@ -579,6 +586,7 @@ int processClientsFromIOThread(IOThread *t) {
         if (node) zfree(node);
         node = listFirst(mainThreadProcessingClients[t->id]);
         listUnlinkNode(mainThreadProcessingClients[t->id], node);
+        processed++;
         client *c = listNodeValue(node);
 
         /* Make sure the client is neither readable nor writable in io thread to
@@ -611,13 +619,21 @@ int processClientsFromIOThread(IOThread *t) {
         if (runClientCronFromIOThread(c)) continue;
 
         /* Process the pending command and input buffer. */
-        if (!isClientReadErrorFatal(c) && c->io_flags & CLIENT_IO_PENDING_COMMAND) {
-            /* IO-thread reads may enqueue one-by-one complete commands that are
-             * executed in main thread without re-entering processInputBuffer().
-             * Account this client as active before processing that handoff path. */
-            statsUpdateActiveClients(c);
-            c->flags |= CLIENT_PENDING_COMMAND;
-            if (processPendingCommandAndInputBuffer(c) == C_ERR) {
+        unsigned long long commands_before = c->commands_processed;
+        if (!isClientReadErrorFatal(c) &&
+            ((c->io_flags & CLIENT_IO_PENDING_COMMAND) ||
+             c->pending_cmds.ready_len ||
+             (c->querybuf && sdslen(c->querybuf) > 0)))
+        {
+            if (c->io_flags & CLIENT_IO_PENDING_COMMAND) {
+                /* IO-thread reads may enqueue one-by-one complete commands that are
+                 * executed in main thread without re-entering processInputBuffer().
+                 * Account this client as active before processing that handoff path. */
+                statsUpdateActiveClients(c);
+                c->flags |= CLIENT_PENDING_COMMAND;
+                c->io_flags &= ~CLIENT_IO_PENDING_COMMAND;
+            }
+            if (processPendingCommandAndInputBuffer(c, IO_THREAD_MAIN_THREAD_COMMAND_QUANTUM) == C_ERR) {
                 /* If the client is no longer valid, it must be freed safely. */
                 continue;
             }
@@ -640,6 +656,22 @@ int processClientsFromIOThread(IOThread *t) {
         /* Handle replica clients in putReplicasInPendingClientsToIOThreads in
          * beforeSleep */
         if (c->flags & CLIENT_SLAVE) continue;
+
+        /* A pipelined client keeps its position in the handoff lane, but yields
+         * after a bounded command slice. Re-linking it at the tail preserves
+         * that client's command order while allowing other clients to run. */
+        if (!(c->flags & (CLIENT_CLOSE_ASAP | CLIENT_CLOSE_AFTER_REPLY)) &&
+            (c->pending_cmds.ready_len ||
+             (c->commands_processed > commands_before && c->querybuf && sdslen(c->querybuf) > 0)))
+        {
+            if (c->flags & CLIENT_PENDING_WRITE) {
+                c->flags &= ~CLIENT_PENDING_WRITE;
+                listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+            }
+            listLinkNodeTail(mainThreadProcessingClients[t->id], node);
+            node = NULL;
+            continue;
+        }
 
         /* Remove this client from pending write clients queue of main thread,
          * And some clients may do not have reply if CLIENT REPLY OFF/SKIP. */
