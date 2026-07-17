@@ -668,6 +668,11 @@ int processClientsFromIOThread(IOThread *t) {
          * race will happen, since we may touch client's data in main thread. */
         if (isClientMustHandledByMainThread(c)) {
             keepClientInMainThread(c);
+            /* The IO thread may already have read a suffix that will not cause
+             * another readable event after this ownership transition. */
+            if ((c->querybuf && sdslen(c->querybuf) > 0) || c->pending_cmds.ready_len) {
+                if (processPendingCommandAndInputBuffer(c, 0, NULL) == C_ERR) continue;
+            }
             continue;
         }
 

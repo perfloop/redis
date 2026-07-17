@@ -12,6 +12,7 @@ redis-check-dump
 redis-cli
 redis-sentinel
 redis-server
+src/redis-server.hol-instrumented
 doc-tools
 release
 misc/*
