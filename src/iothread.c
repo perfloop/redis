@@ -25,6 +25,53 @@ static int mainThreadPreferNewClients[IO_THREADS_MAX_NUM]; /* Alternate fresh/re
 static pthread_mutex_t mainThreadPendingClientsMutexes[IO_THREADS_MAX_NUM]; /* Mutex for pending clients */
 static eventNotifier* mainThreadPendingClientsNotifiers[IO_THREADS_MAX_NUM]; /* Notifier for pending clients */
 
+static inline int clientHasBufferedInput(client *c) {
+    return c->pending_cmds.ready_len || (c->querybuf && sdslen(c->querybuf) > 0);
+}
+
+/* An ownership transition can leave already-read input without another socket
+ * readability event. Keep it on the main thread, but give it the same bounded
+ * continuation discipline as the IO-thread handoff lane. */
+static void queueClientForMainThreadRead(client *c) {
+    serverAssert(c->running_tid == IOTHREAD_MAIN_THREAD_ID);
+    if (c->flags & CLIENT_PENDING_MAIN_THREAD_READ) return;
+
+    c->flags |= CLIENT_PENDING_MAIN_THREAD_READ;
+    listLinkNodeTail(server.clients_pending_read, &c->clients_pending_read_node);
+}
+
+int processClientsWithPendingReads(void) {
+    int processed = 0;
+    while (listLength(server.clients_pending_read) &&
+           processed < IO_THREAD_MAX_PENDING_CLIENTS) {
+        listNode *node = listFirst(server.clients_pending_read);
+        client *c = listNodeValue(node);
+        listUnlinkNode(server.clients_pending_read, node);
+        c->flags &= ~CLIENT_PENDING_MAIN_THREAD_READ;
+
+        int command_limit_reached = 0;
+        if (processPendingCommandAndInputBuffer(c,
+                                                IO_THREAD_MAIN_THREAD_COMMAND_QUANTUM,
+                                                &command_limit_reached) == C_ERR)
+        {
+            processed++;
+            continue;
+        }
+        if (!(c->flags & CLIENT_PENDING_WRITE) && clientHasPendingReplies(c))
+            putClientInPendingWriteQueue(c);
+
+        if (command_limit_reached &&
+            !(c->flags & (CLIENT_BLOCKED | CLIENT_UNBLOCKED |
+                          CLIENT_CLOSE_ASAP | CLIENT_CLOSE_AFTER_REPLY)) &&
+            clientHasBufferedInput(c))
+        {
+            queueClientForMainThreadRead(c);
+        }
+        processed++;
+    }
+    return processed;
+}
+
 /* Send the clients to the main thread for processing when the number of clients
  * in pending list reaches IO_THREAD_MAX_PENDING_CLIENTS, or check_size is 0. */
 static inline void sendPendingClientsToMainThreadIfNeeded(IOThread *t, int check_size) {
@@ -669,11 +716,8 @@ int processClientsFromIOThread(IOThread *t) {
          * race will happen, since we may touch client's data in main thread. */
         if (isClientMustHandledByMainThread(c)) {
             keepClientInMainThread(c);
-            /* The IO thread may already have read a suffix that will not cause
-             * another readable event after this ownership transition. */
-            if ((c->querybuf && sdslen(c->querybuf) > 0) || c->pending_cmds.ready_len) {
-                if (processPendingCommandAndInputBuffer(c, 0, NULL) == C_ERR) continue;
-            }
+            if (clientHasBufferedInput(c))
+                queueClientForMainThreadRead(c);
             continue;
         }
 

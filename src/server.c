@@ -1951,7 +1951,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         processed += freeClientsInAsyncFreeQueue();
 
         /* Let the clients after the blocking call be processed. */
-        processClientsOfAllIOThreads();
+        processed += processClientsOfAllIOThreads();
+        processed += processClientsWithPendingReads();
         /* New connections may have been established while blocked, clients from
          * IO thread may have replies to write, ensure they are promptly sent to
          * IO threads. */
@@ -2059,7 +2060,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (server.io_threads_num > 1) {
         /* Corresponding to IOThreadBeforeSleep, process the clients from IO threads
          * without notification. */
-        if (processClientsOfAllIOThreads() > 0) {
+        int io_clients_processed = processClientsOfAllIOThreads();
+        io_clients_processed += processClientsWithPendingReads();
+        if (io_clients_processed > 0) {
             /* If there are clients that are processed, it means IO thread is busy to
              * trafer clients to main thread, so the main thread does not sleep. */
             dont_sleep = 1;
@@ -2068,7 +2071,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
             atomicSetWithSync(server.running, 0); /* Not running if going to sleep. */
             /* Try to process the clients from IO threads again, since before setting running
              * to 0, some clients may be transferred without notification. */
-            processClientsOfAllIOThreads();
+            io_clients_processed = processClientsOfAllIOThreads();
+            io_clients_processed += processClientsWithPendingReads();
+            if (io_clients_processed > 0) dont_sleep = 1;
         }
     }
 

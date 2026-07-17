@@ -241,6 +241,7 @@ client *createClient(connection *conn) {
     c->auth_callback_privdata = NULL;
     c->auth_module = NULL;
     listInitNode(&c->clients_pending_write_node, c);
+    listInitNode(&c->clients_pending_read_node, c);
     listInitNode(&c->pending_ref_reply_node, c);
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
@@ -1931,6 +1932,12 @@ void unlinkClient(client *c) {
                      &c->clients_pending_write_node.prev != NULL);
         listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         c->flags &= ~CLIENT_PENDING_WRITE;
+    }
+
+    /* Remove from the main-thread buffered-input queue if needed. */
+    if (c->flags & CLIENT_PENDING_MAIN_THREAD_READ) {
+        listUnlinkNode(server.clients_pending_read, &c->clients_pending_read_node);
+        c->flags &= ~CLIENT_PENDING_MAIN_THREAD_READ;
     }
 
     /* When client was just unblocked because of a blocking operation,
