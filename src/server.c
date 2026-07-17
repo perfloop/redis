@@ -1951,7 +1951,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         processed += freeClientsInAsyncFreeQueue();
 
         /* Let the clients after the blocking call be processed. */
-        processed += processClientsOfAllIOThreads();
+        processClientsOfAllIOThreads();
         processed += processClientsWithPendingReads();
         /* New connections may have been established while blocked, clients from
          * IO thread may have replies to write, ensure they are promptly sent to

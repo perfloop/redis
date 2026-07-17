@@ -730,7 +730,7 @@ int processClientsFromIOThread(IOThread *t) {
          * handoff lane, but yields. Re-linking it at the tail preserves that
          * client's command order while allowing other clients to run. */
         if (command_limit_reached &&
-            !(c->flags & (CLIENT_CLOSE_ASAP | CLIENT_CLOSE_AFTER_REPLY | CLIENT_MASTER)) &&
+            !(c->flags & (CLIENT_CLOSE_ASAP | CLIENT_CLOSE_AFTER_REPLY)) &&
             (c->pending_cmds.ready_len || (c->querybuf && sdslen(c->querybuf) > 0)))
         {
             if (c->flags & CLIENT_PENDING_WRITE) {
