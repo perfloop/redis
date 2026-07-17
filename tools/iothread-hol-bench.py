@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Measure IO-thread handoff head-of-line behavior with an instrumented workload.
 
-The mixed workload uses one Redis IO worker (``io-threads 2``), sixteen native
+The mixed workload uses two Redis IO workers (``io-threads 3``), sixteen native
 ``redis-benchmark`` bulk clients with a pipeline of 256, and one non-pipelined
-short ECHO stream.  The bulk clients run continuously while the short stream is
-measured.  A separate finite native bulk probe overlaps the short stream to
-report bulk-class p50/p99 latency.  A temporary Redis module command filter
-timestamps each short command immediately before Redis executes it, groups the
-tagged sustained workload commands by main event-loop turn, and records
-submitted-but-unexecuted pipeline commands at turn boundaries.  The module is
-measurement-only: it does not rewrite commands or alter Redis scheduling.
+short ECHO stream. The bulk clients run continuously while the short stream is
+measured. A separate finite native bulk probe overlaps the short stream to
+report bulk-class p50/p99 latency. The benchmark build injects read-only hooks
+directly around ``processClientsFromIOThread`` to record real invocation
+boundaries, command counts, and residual client-list depth. A temporary Redis
+module timestamps each short command immediately before Redis executes it and
+associates tagged traffic with that hook's IO-worker queue. Neither component
+rewrites commands or changes production scheduling.
 
 The short stream calibrates the module's monotonic-clock domain with minimum
 round-trip samples before it sends its timestamped commands.  Its server-side
@@ -36,6 +37,8 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 
+IO_WORKERS = 2
+REDIS_IO_THREADS = IO_WORKERS + 1
 BULK_CLIENTS = 16
 BULK_PIPELINE = 256
 # The sustained bulk generator has far more requests than one proof sample can
@@ -62,16 +65,21 @@ MIXED_METRICS = (
     "bulk_pipeline_p50_latency_us",
     "bulk_pipeline_p99_latency_us",
     "mixed_total_ops_per_sec",
-    "main_callback_clients_per_invocation_max",
-    "main_callback_commands_per_invocation_max",
-    "residual_queue_depth_after_callback_max",
-    "server_eventloop_commands_per_cycle_max",
-    "instrumented_event_loop_cycles",
+    "scheduler_clients_per_invocation_max",
+    "scheduler_commands_per_invocation_max",
+    "scheduler_residual_queue_depth_after_invocation_max",
+    "scheduler_io_workers_observed",
+    "bulk_io_workers_observed",
+    "least_bulk_io_worker_commands",
 )
 
 MIXED_THROUGHPUT_METRICS = (
     "mixed_total_ops_per_sec",
     "mixed_bulk_ops_per_sec",
+)
+
+MIXED_FAIRNESS_METRICS = (
+    "mixed_least_bulk_io_worker_ops_per_sec",
 )
 
 
@@ -241,7 +249,7 @@ class RedisServer:
                 "--port", str(self.port),
                 "--save", "",
                 "--appendonly", "no",
-                "--io-threads", "2",
+                "--io-threads", str(REDIS_IO_THREADS),
                 "--dir", str(directory),
                 "--logfile", str(self.logfile),
                 "--loglevel", "warning",
@@ -381,14 +389,6 @@ class IothreadHolBenchmark:
         finally:
             connection.close()
         return parse_info_value(info, "total_commands_processed")
-
-    def server_eventloop_commands_max(self) -> int:
-        connection = self.connection()
-        try:
-            info = expect_text(connection.command("INFO", "debug"), "INFO debug")
-        finally:
-            connection.close()
-        return parse_info_value(info, "eventloop_cmd_per_cycle_max")
 
     def module_command(self, *parts: str) -> object:
         connection = self.connection()
@@ -586,6 +586,10 @@ class IothreadHolBenchmark:
         if actual is None or actual < minimum:
             raise BenchError(f"HOL.STATS {name}={actual!r}, expected at least {minimum}")
 
+    @staticmethod
+    def bulk_worker_counts(stats: dict[str, int]) -> tuple[int, ...]:
+        return tuple(stats.get(f"bulk_worker_{worker}_commands", 0) for worker in range(1, IO_WORKERS + 1))
+
     def validate_mixed_stats(self, stats: dict[str, int], short: LatencyResult) -> None:
         self.require_stat(stats, "bulk_client_count", BULK_CLIENTS)
         self.require_stat_at_least(stats, "bulk_commands_executed", MIN_ACTIVE_BULK_COMMANDS)
@@ -593,15 +597,23 @@ class IothreadHolBenchmark:
         self.require_stat(stats, "short_client_count", 1)
         self.require_stat(stats, "short_commands_executed", SHORT_REQUESTS)
         self.require_stat(stats, "short_enqueue_to_execution_samples", SHORT_REQUESTS)
-        self.require_stat(stats, "bulk_pipeline_size", BULK_PIPELINE)
+        self.require_stat(stats, "scheduler_io_workers_observed", IO_WORKERS)
+        self.require_stat(stats, "bulk_io_workers_observed", IO_WORKERS)
         if stats.get("delay_samples_dropped", 0) != 0:
             raise BenchError(f"HOL.STATS dropped delay samples: {stats['delay_samples_dropped']}")
-        if stats.get("instrumented_event_loop_cycles", 0) <= 0:
-            raise BenchError("HOL.STATS observed no event-loop cycles")
-        if stats.get("main_callback_clients_per_invocation_max", 0) <= 0:
-            raise BenchError("HOL.STATS observed no clients in a main callback")
-        if stats.get("main_callback_commands_per_invocation_max", 0) <= 0:
-            raise BenchError("HOL.STATS observed no commands in a main callback")
+        if stats.get("unattributed_tagged_commands", 0) != 0:
+            raise BenchError("tagged workload commands escaped processClientsFromIOThread instrumentation")
+        if stats.get("classification_errors", 0) != 0:
+            raise BenchError("tagged client changed class or IO-worker assignment during the sample")
+        for worker, count in enumerate(self.bulk_worker_counts(stats), start=1):
+            if count <= 0:
+                raise BenchError(f"HOL.STATS recorded no bulk progress for IO worker {worker}")
+        if stats.get("scheduler_invocation_count", 0) <= 0:
+            raise BenchError("HOL.STATS observed no processClientsFromIOThread invocations")
+        if stats.get("scheduler_clients_per_invocation_max", 0) <= 0:
+            raise BenchError("HOL.STATS observed no clients in a scheduler invocation")
+        if stats.get("scheduler_commands_per_invocation_max", 0) <= 0:
+            raise BenchError("HOL.STATS observed no commands in a scheduler invocation")
         queue_p99 = stats.get("short_enqueue_to_execution_p99_us", 0)
         if queue_p99 < 0 or queue_p99 > short.p99_us + 2_000.0:
             raise BenchError(
@@ -637,9 +649,6 @@ class IothreadHolBenchmark:
             self.stop_bulk()
             stats = self.module_stats()
             self.validate_mixed_stats(stats, mixed)
-            eventloop_commands = self.server_eventloop_commands_max()
-            if eventloop_commands <= 0:
-                raise BenchError("INFO debug recorded no commands in an event-loop cycle")
             return {
                 "short_idle_p99_latency_us": idle.p99_us,
                 "short_request_p50_latency_us": mixed.p50_us,
@@ -655,17 +664,14 @@ class IothreadHolBenchmark:
                 "bulk_pipeline_p50_latency_us": bulk.p50_us,
                 "bulk_pipeline_p99_latency_us": bulk.p99_us,
                 "mixed_total_ops_per_sec": (after - before) / elapsed,
-                "main_callback_clients_per_invocation_max": float(
-                    stats["main_callback_clients_per_invocation_max"]
+                "scheduler_clients_per_invocation_max": float(stats["scheduler_clients_per_invocation_max"]),
+                "scheduler_commands_per_invocation_max": float(stats["scheduler_commands_per_invocation_max"]),
+                "scheduler_residual_queue_depth_after_invocation_max": float(
+                    stats["scheduler_residual_queue_depth_after_invocation_max"]
                 ),
-                "main_callback_commands_per_invocation_max": float(
-                    stats["main_callback_commands_per_invocation_max"]
-                ),
-                "residual_queue_depth_after_callback_max": float(
-                    stats["residual_queue_depth_after_callback_max"]
-                ),
-                "server_eventloop_commands_per_cycle_max": float(eventloop_commands),
-                "instrumented_event_loop_cycles": float(stats["instrumented_event_loop_cycles"]),
+                "scheduler_io_workers_observed": float(stats["scheduler_io_workers_observed"]),
+                "bulk_io_workers_observed": float(stats["bulk_io_workers_observed"]),
+                "least_bulk_io_worker_commands": float(stats["least_bulk_io_worker_commands"]),
             }
         finally:
             self.close()
@@ -681,6 +687,7 @@ class IothreadHolBenchmark:
             self.wait_for_bulk_traffic()
             before_stats = self.module_stats()
             bulk_before = before_stats.get("bulk_commands_executed", 0)
+            bulk_workers_before = self.bulk_worker_counts(before_stats)
             with pinned_to(self.layout.short):
                 before = self.total_commands_processed()
                 started = time.monotonic()
@@ -693,18 +700,30 @@ class IothreadHolBenchmark:
                 raise BenchError("mixed throughput guard did not advance server command counters")
             stats = self.module_stats()
             bulk_after = stats.get("bulk_commands_executed", 0)
+            bulk_workers_after = self.bulk_worker_counts(stats)
             self.require_stat(stats, "bulk_client_count", BULK_CLIENTS)
             self.require_stat(stats, "short_client_count", 1)
             self.require_stat(stats, "short_commands_executed", MIXED_GUARD_SHORT_REQUESTS)
             self.require_stat(stats, "short_enqueue_to_execution_samples", MIXED_GUARD_SHORT_REQUESTS)
+            self.require_stat(stats, "scheduler_io_workers_observed", IO_WORKERS)
+            self.require_stat(stats, "bulk_io_workers_observed", IO_WORKERS)
             if stats.get("delay_samples_dropped", 0) != 0:
                 raise BenchError("instrumentation dropped short delay samples during the mixed throughput guard")
-            if bulk_after <= bulk_before:
-                raise BenchError("bulk clients made no progress during the mixed throughput guard")
+            if stats.get("unattributed_tagged_commands", 0) != 0:
+                raise BenchError("tagged workload commands escaped scheduler instrumentation")
+            if stats.get("classification_errors", 0) != 0:
+                raise BenchError("tagged client changed class or IO-worker assignment during the guard")
+            bulk_worker_deltas = tuple(
+                after_count - before_count
+                for before_count, after_count in zip(bulk_workers_before, bulk_workers_after)
+            )
+            if bulk_after <= bulk_before or min(bulk_worker_deltas) <= 0:
+                raise BenchError("an IO-worker bulk queue made no progress during the mixed throughput guard")
             self.stop_bulk()
             return {
                 "mixed_total_ops_per_sec": (after - before) / elapsed,
                 "mixed_bulk_ops_per_sec": (bulk_after - bulk_before) / elapsed,
+                "mixed_least_bulk_io_worker_ops_per_sec": min(bulk_worker_deltas) / elapsed,
             }
         finally:
             self.close()
@@ -763,8 +782,21 @@ class IothreadHolBenchmark:
             self.require_stat(stats, "short_client_count", 1)
             self.require_stat(stats, "short_commands_executed", 32)
             self.require_stat(stats, "short_enqueue_to_execution_samples", 32)
+            self.require_stat(stats, "scheduler_io_workers_observed", IO_WORKERS)
+            self.require_stat(stats, "bulk_io_workers_observed", IO_WORKERS)
+            if stats.get("scheduler_clients_per_invocation_max", 0) <= 0:
+                raise BenchError("server instrumentation observed no scheduler clients during verification")
+            if stats.get("scheduler_commands_per_invocation_max", 0) <= 0:
+                raise BenchError("server instrumentation observed no scheduler commands during verification")
             if stats.get("delay_samples_dropped", 0) != 0:
                 raise BenchError("instrumentation dropped short delay samples during verification")
+            if stats.get("unattributed_tagged_commands", 0) != 0:
+                raise BenchError("tagged verification commands escaped scheduler instrumentation")
+            if stats.get("classification_errors", 0) != 0:
+                raise BenchError("tagged verification client changed class or IO-worker assignment")
+            for worker, count in enumerate(self.bulk_worker_counts(stats), start=1):
+                if count <= 0:
+                    raise BenchError(f"verification recorded no bulk progress for IO worker {worker}")
         finally:
             if short_connection is not None:
                 short_connection.close()
@@ -789,9 +821,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("mixed", "mixed-throughput"),
+        choices=("mixed", "mixed-throughput", "mixed-fairness"),
         default="mixed",
-        help="run the mixed proof selector or the mixed throughput guard",
+        help="run the mixed proof selector, throughput guard, or cross-worker fairness guard",
     )
     parser.add_argument(
         "--verify",
@@ -812,6 +844,9 @@ def main() -> int:
         elif args.mode == "mixed-throughput":
             metrics = bench.measure_mixed_throughput()
             names = MIXED_THROUGHPUT_METRICS
+        else:
+            metrics = bench.measure_mixed_throughput()
+            names = MIXED_FAIRNESS_METRICS
         for name in names:
             print(json.dumps({"metric": name, "value": metrics[name]}, separators=(",", ":")))
         return 0
