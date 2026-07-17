@@ -13,6 +13,9 @@
 /* IO threads. */
 IOThread IOThreads[IO_THREADS_MAX_NUM];
 
+/* Interleave pipelined clients without letting one callback run indefinitely. */
+#define IO_THREAD_MAIN_THREAD_CLIENT_QUANTA_PER_PASS 64
+
 /* For main thread */
 static list *mainThreadPendingClientsToIOThreads[IO_THREADS_MAX_NUM]; /* Clients to IO threads */
 static list *mainThreadProcessingClients[IO_THREADS_MAX_NUM]; /* Clients in processing */
@@ -552,12 +555,14 @@ static inline void sendPendingClientsToIOThreadIfNeeded(IOThread *t, int size_ch
  * it may call this function reentrantly. */
 int processClientsFromIOThread(IOThread *t) {
     /* Get the list of clients to process. */
+    int has_yielded_client = listLength(mainThreadProcessingClients[t->id]) > 0;
     pthread_mutex_lock(&mainThreadPendingClientsMutexes[t->id]);
     listJoin(mainThreadProcessingClients[t->id], mainThreadPendingClients[t->id]);
     pthread_mutex_unlock(&mainThreadPendingClientsMutexes[t->id]);
     size_t processed = listLength(mainThreadProcessingClients[t->id]);
     if (processed == 0) return 0;
 
+    processed = 0;
     int prefetch_clients = 0;
     /* We may call processClientsFromIOThread reentrantly, so we need to
      * reset the prefetching batch, besides, users may change the config
@@ -565,7 +570,8 @@ int processClientsFromIOThread(IOThread *t) {
     resetCommandsBatch();
 
     listNode *node = NULL;
-    while (listLength(mainThreadProcessingClients[t->id])) {
+    while (listLength(mainThreadProcessingClients[t->id]) &&
+           processed < IO_THREAD_MAIN_THREAD_CLIENT_QUANTA_PER_PASS) {
         if (prefetch_clients <= 0) {
             /* Reset the prefetching batch if we have processed all clients. */
             resetCommandsBatch();
@@ -579,6 +585,7 @@ int processClientsFromIOThread(IOThread *t) {
         if (node) zfree(node);
         node = listFirst(mainThreadProcessingClients[t->id]);
         listUnlinkNode(mainThreadProcessingClients[t->id], node);
+        processed++;
         client *c = listNodeValue(node);
 
         /* Make sure the client is neither readable nor writable in io thread to
@@ -610,15 +617,24 @@ int processClientsFromIOThread(IOThread *t) {
         /* Check if we need to run a cron job for the client */
         if (runClientCronFromIOThread(c)) continue;
 
-        /* Process the pending command and input buffer. */
-        if (!isClientReadErrorFatal(c) && c->io_flags & CLIENT_IO_PENDING_COMMAND) {
-            /* IO-thread reads may enqueue one-by-one complete commands that are
-             * executed in main thread without re-entering processInputBuffer().
-             * Account this client as active before processing that handoff path. */
-            statsUpdateActiveClients(c);
-            c->flags |= CLIENT_PENDING_COMMAND;
-            if (processPendingCommandAndInputBuffer(c) == C_ERR) {
-                /* If the client is no longer valid, it must be freed safely. */
+        /* Execute a bounded decoded batch quantum before giving another client
+         * a turn. Buffered input is relinked below, preserving its own command
+         * order while avoiding a full pipeline drain here. */
+        if (!isClientReadErrorFatal(c)) {
+            c->io_flags &= ~CLIENT_IO_MAIN_THREAD_YIELDED;
+            c->io_flags |= CLIENT_IO_MAIN_THREAD_YIELD;
+            if (c->io_flags & CLIENT_IO_PENDING_COMMAND) {
+                /* IO-thread reads may enqueue one-by-one complete commands that
+                 * are executed in main thread without re-entering input parsing. */
+                statsUpdateActiveClients(c);
+                c->io_flags &= ~CLIENT_IO_PENDING_COMMAND;
+                c->flags |= CLIENT_PENDING_COMMAND;
+                if (processPendingCommandAndInputBuffer(c) == C_ERR) {
+                    /* If the client is no longer valid, it must be freed safely. */
+                    continue;
+                }
+            } else if (processInputBuffer(c) == C_ERR) {
+                /* A residual client can be freed while executing a command. */
                 continue;
             }
         }
@@ -633,14 +649,33 @@ int processClientsFromIOThread(IOThread *t) {
         /* The client only can be processed in the main thread, otherwise data
          * race will happen, since we may touch client's data in main thread. */
         if (isClientMustHandledByMainThread(c)) {
+            c->io_flags &= ~(CLIENT_IO_MAIN_THREAD_YIELD | CLIENT_IO_MAIN_THREAD_YIELDED);
             keepClientInMainThread(c);
             continue;
         }
 
         /* Handle replica clients in putReplicasInPendingClientsToIOThreads in
          * beforeSleep */
-        if (c->flags & CLIENT_SLAVE) continue;
+        if (c->flags & CLIENT_SLAVE) {
+            c->io_flags &= ~(CLIENT_IO_MAIN_THREAD_YIELD | CLIENT_IO_MAIN_THREAD_YIELDED);
+            continue;
+        }
 
+        /* Keep a client with locally buffered input on this main-thread queue
+         * for its next turn. An incomplete request returns to its IO thread. */
+        if ((c->io_flags & CLIENT_IO_MAIN_THREAD_YIELDED) &&
+            ((c->querybuf && sdslen(c->querybuf) > 0) || c->pending_cmds.ready_len > 0)) {
+            if (c->flags & CLIENT_PENDING_WRITE) {
+                c->flags &= ~CLIENT_PENDING_WRITE;
+                listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+            }
+            listLinkNodeTail(mainThreadProcessingClients[t->id], node);
+            has_yielded_client = 1;
+            node = NULL;
+            continue;
+        }
+
+        c->io_flags &= ~(CLIENT_IO_MAIN_THREAD_YIELD | CLIENT_IO_MAIN_THREAD_YIELDED);
         /* Remove this client from pending write clients queue of main thread,
          * And some clients may do not have reply if CLIENT REPLY OFF/SKIP. */
         if (c->flags & CLIENT_PENDING_WRITE) {
@@ -651,8 +686,9 @@ int processClientsFromIOThread(IOThread *t) {
         listLinkNodeHead(mainThreadPendingClientsToIOThreads[c->tid], node);
         node = NULL;
 
-        /* If there are several clients to process, let io thread handle them ASAP. */
-        sendPendingClientsToIOThreadIfNeeded(t, 1);
+        /* Once a pipelined client has yielded, return completed clients now
+         * instead of waiting for the normal handoff batch to fill. */
+        sendPendingClientsToIOThreadIfNeeded(t, has_yielded_client ? 0 : 1);
     }
     if (node) zfree(node);
 
@@ -694,10 +730,16 @@ void handleClientsFromIOThread(struct aeEventLoop *el, int fd, void *ptr, int ma
  * In beforeSleep, we also call this function to handle the clients that are
  * transferred from io threads without notification. */
 int processClientsOfAllIOThreads(void) {
+    static int next_io_thread = 1;
     int processed = 0;
-    for (int i = 1; i < server.io_threads_num; i++) {
-        processed += processClientsFromIOThread(&IOThreads[i]);
+
+    for (int offset = 0; offset < server.io_threads_num - 1; offset++) {
+        int io_thread = next_io_thread + offset;
+        if (io_thread >= server.io_threads_num) io_thread -= server.io_threads_num - 1;
+        processed += processClientsFromIOThread(&IOThreads[io_thread]);
     }
+    next_io_thread++;
+    if (next_io_thread >= server.io_threads_num) next_io_thread = 1;
     return processed;
 }
 

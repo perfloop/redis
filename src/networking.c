@@ -3533,6 +3533,11 @@ int processPendingCommandAndInputBuffer(client *c) {
         if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
+        /* The first handoff command can complete the first decoded batch.
+         * processInputBuffer() yields after the following batch. */
+        if ((c->io_flags & CLIENT_IO_MAIN_THREAD_YIELD) &&
+            c->pending_cmds.ready_len == 0)
+            c->io_flags |= CLIENT_IO_MAIN_THREAD_YIELDED;
     }
 
     /* Now process client if it has more data in it's buffer.
@@ -3634,7 +3639,10 @@ int processInputBuffer(client *c) {
     /* Keep active-client window updates on main-thread paths only (here and
      * in IO-thread handoff processing) to avoid races with serverCron()
      * maintenance of the circular slots. */
-    if (c->running_tid == IOTHREAD_MAIN_THREAD_ID)
+    /* The IO-thread handoff records activity before its first batch. Residual
+     * batches must not count the same client repeatedly. */
+    if (c->running_tid == IOTHREAD_MAIN_THREAD_ID &&
+        !(c->io_flags & CLIENT_IO_MAIN_THREAD_YIELD))
         statsUpdateActiveClients(c);
 
     /* We limit the lookahead for unauthenticated connections to 1.
@@ -3794,6 +3802,15 @@ int processInputBuffer(client *c) {
                  * loop and trimming the client buffer later. So we return
                  * ASAP in that case. */
                 return C_ERR;
+            }
+            /* A quantum consumes two decoded batches. The first boundary
+             * allows another batch to be parsed; the second leaves later input
+             * for processClientsFromIOThread() to schedule fairly. */
+            if ((c->io_flags & CLIENT_IO_MAIN_THREAD_YIELD) &&
+                c->pending_cmds.ready_len == 0) {
+                if (c->io_flags & CLIENT_IO_MAIN_THREAD_YIELDED)
+                    break;
+                c->io_flags |= CLIENT_IO_MAIN_THREAD_YIELDED;
             }
         }
     }
