@@ -3725,7 +3725,7 @@ void preprocessCommand(client *c, pendingCommand *pcmd);
 int processCommand(client *c);
 void commandProcessed(client *c);
 void prepareForNextCommand(client *c, int update_slot_stats);
-int processPendingCommandAndInputBuffer(client *c, int command_limit, int *limit_reached);
+int processPendingCommandAndInputBuffer(client *c, int command_limit, int *command_limit_reached);
 int processCommandAndResetClient(client *c);
 int areCommandKeysInSameSlot(client *c, int *hashslot);
 void setupSignalHandlers(void);

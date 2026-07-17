@@ -138,10 +138,26 @@ static void hol_finish_drain(size_t residual) {
     hol_drain_active = 0;
 }
 
+static int hol_account_client_slice(client *c, hol_client_slot *slot) {
+    uint64_t before;
+
+    if (slot == NULL || !atomic_exchange_explicit(&slot->inflight, 0, memory_order_acq_rel))
+        return 0;
+    before = atomic_load_explicit(&slot->commands_before, memory_order_acquire);
+    if (hol_drain_active && c->commands_processed >= before)
+        hol_active_commands += c->commands_processed - before;
+    return 1;
+}
+
 static void perfloop_hol_list_join(list *destination, list *source) {
     list *pending;
 
     if (hol_is_enabled()) {
+        /* A new batch is being promoted ahead of residual work. Finalize the
+         * old invocation before moving those residual nodes. */
+        if (hol_drain_active && destination == hol_pending_list && source == hol_processing_list)
+            hol_finish_drain(source->len);
+
         /* This is the IO-thread -> main-thread transfer. */
         if (source == IOThreads[1].pending_clients_to_main_thread) {
             atomic_store_explicit(&hol_pending_list, destination, memory_order_release);
@@ -165,12 +181,16 @@ static void perfloop_hol_list_join(list *destination, list *source) {
 }
 
 static void perfloop_hol_list_link_tail(list *target, listNode *node) {
-    if (hol_is_enabled() && target == IOThreads[1].pending_clients_to_main_thread) {
+    if (hol_is_enabled()) {
         client *c = listNodeValue(node);
-        hol_client_slot *slot = hol_client_slot_for(c, 1);
-        if (slot != NULL) {
-            atomic_store_explicit(&slot->enqueue_us, hol_now_us(), memory_order_release);
-            atomic_store_explicit(&slot->inflight, 0, memory_order_release);
+        if (target == IOThreads[1].pending_clients_to_main_thread) {
+            hol_client_slot *slot = hol_client_slot_for(c, 1);
+            if (slot != NULL) {
+                atomic_store_explicit(&slot->enqueue_us, hol_now_us(), memory_order_release);
+                atomic_store_explicit(&slot->inflight, 0, memory_order_release);
+            }
+        } else if (hol_drain_active && target == hol_processing_list) {
+            hol_account_client_slice(c, hol_client_slot_for(c, 0));
         }
     }
 
@@ -198,6 +218,7 @@ static void perfloop_hol_list_unlink(list *target, listNode *node) {
                     break;
                 }
             }
+            atomic_store_explicit(&slot->enqueue_us, 0, memory_order_release);
             atomic_store_explicit(&slot->commands_before, c->commands_processed, memory_order_release);
             atomic_store_explicit(&slot->inflight, 1, memory_order_release);
         }
@@ -210,12 +231,8 @@ static void perfloop_hol_list_link_head(list *target, listNode *node) {
     if (hol_is_enabled()) {
         client *c = listNodeValue(node);
         hol_client_slot *slot = hol_client_slot_for(c, 0);
-        if (slot != NULL && atomic_exchange_explicit(&slot->inflight, 0, memory_order_acq_rel)) {
-            uint64_t before = atomic_load_explicit(&slot->commands_before, memory_order_acquire);
-            if (hol_drain_active && c->commands_processed >= before)
-                hol_active_commands += c->commands_processed - before;
+        if (hol_account_client_slice(c, slot))
             atomic_store_explicit(&slot->enqueue_us, 0, memory_order_release);
-        }
     }
 
     (listLinkNodeHead)(target, node);

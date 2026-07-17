@@ -21,6 +21,7 @@ IOThread IOThreads[IO_THREADS_MAX_NUM];
 static list *mainThreadPendingClientsToIOThreads[IO_THREADS_MAX_NUM]; /* Clients to IO threads */
 static list *mainThreadProcessingClients[IO_THREADS_MAX_NUM]; /* Clients in processing */
 static list *mainThreadPendingClients[IO_THREADS_MAX_NUM]; /* Pending clients from IO threads */
+static int mainThreadPreferNewClients[IO_THREADS_MAX_NUM]; /* Alternate fresh/residual queue priority. */
 static pthread_mutex_t mainThreadPendingClientsMutexes[IO_THREADS_MAX_NUM]; /* Mutex for pending clients */
 static eventNotifier* mainThreadPendingClientsNotifiers[IO_THREADS_MAX_NUM]; /* Notifier for pending clients */
 
@@ -555,8 +556,21 @@ static inline void sendPendingClientsToIOThreadIfNeeded(IOThread *t, int size_ch
  * process new events, if the clients with fired events from the same io thread,
  * it may call this function reentrantly. */
 int processClientsFromIOThread(IOThread *t) {
-    /* Get the list of clients to process. */
+    /* Get the list of clients to process. Alternate between residual work and
+     * a newly arrived batch so either class makes progress under contention. */
+    int client_slice_limit = IO_THREAD_MAX_PENDING_CLIENTS * 2;
     pthread_mutex_lock(&mainThreadPendingClientsMutexes[t->id]);
+    int has_residual = listLength(mainThreadProcessingClients[t->id]) != 0;
+    int has_pending = listLength(mainThreadPendingClients[t->id]) != 0;
+    if (has_residual && has_pending) {
+        /* Shorten a contended turn so fresh work gets an earlier next turn.
+         * Without new work, a second batch amortizes handoff overhead. */
+        client_slice_limit = IO_THREAD_MAX_PENDING_CLIENTS;
+        if (mainThreadPreferNewClients[t->id]) {
+            listJoin(mainThreadPendingClients[t->id], mainThreadProcessingClients[t->id]);
+        }
+        mainThreadPreferNewClients[t->id] = !mainThreadPreferNewClients[t->id];
+    }
     listJoin(mainThreadProcessingClients[t->id], mainThreadPendingClients[t->id]);
     pthread_mutex_unlock(&mainThreadPendingClientsMutexes[t->id]);
     if (listLength(mainThreadProcessingClients[t->id]) == 0) return 0;
@@ -572,7 +586,7 @@ int processClientsFromIOThread(IOThread *t) {
     /* A requeued pipeline keeps this list nonempty, so bound the number of
      * client slices before returning to the event loop. */
     while (listLength(mainThreadProcessingClients[t->id]) &&
-           processed < IO_THREAD_MAX_PENDING_CLIENTS * 2) {
+           processed < client_slice_limit) {
         if (prefetch_clients <= 0) {
             /* Reset the prefetching batch if we have processed all clients. */
             resetCommandsBatch();
@@ -967,6 +981,7 @@ void initThreadedIO(void) {
         mainThreadPendingClientsToIOThreads[i] = listCreate();
         mainThreadPendingClients[i] = listCreate();
         mainThreadProcessingClients[i] = listCreate();
+        mainThreadPreferNewClients[i] = 1;
         pthread_mutex_init(&mainThreadPendingClientsMutexes[i], attr);
         mainThreadPendingClientsNotifiers[i] = createEventNotifier();
         if (aeCreateFileEvent(server.el, getReadEventFd(mainThreadPendingClientsNotifiers[i]),
