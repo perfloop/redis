@@ -44,8 +44,8 @@ BULK_PIPELINE = 256
 BULK_SUSTAINED_REQUESTS = BULK_CLIENTS * BULK_PIPELINE * 262_144
 BULK_PROBE_CLIENTS = 1
 BULK_PROBE_REQUESTS = BULK_PIPELINE * 4096
-THROUGHPUT_REQUESTS = BULK_CLIENTS * BULK_PIPELINE * 1024
 SHORT_REQUESTS = 5_000
+MIXED_GUARD_SHORT_REQUESTS = 1_000
 WARMUP_REQUESTS = 10_000
 MIN_ACTIVE_BULK_COMMANDS = 100_000
 MIN_ACTIVE_BULK_PROBE_COMMANDS = 10_000
@@ -67,6 +67,11 @@ MIXED_METRICS = (
     "residual_queue_depth_after_callback_max",
     "server_eventloop_commands_per_cycle_max",
     "instrumented_event_loop_cycles",
+)
+
+MIXED_THROUGHPUT_METRICS = (
+    "mixed_total_ops_per_sec",
+    "mixed_bulk_ops_per_sec",
 )
 
 
@@ -665,25 +670,42 @@ class IothreadHolBenchmark:
         finally:
             self.close()
 
-    def measure_throughput(self) -> dict[str, float]:
+    def measure_mixed_throughput(self) -> dict[str, float]:
+        """Guard bulk progress and aggregate throughput during the contested shape."""
         try:
             self.redis.start()
             self.warmup()
-            output = self.run_checked(
-                taskset_command(
-                    self.layout.bulk,
-                    self.benchmark_command(
-                        BULK_CLIENTS,
-                        BULK_PIPELINE,
-                        THROUGHPUT_REQUESTS,
-                        2,
-                        ("PING",),
-                        csv_output=True,
-                    ),
-                )
-            )
-            result = self.parse_latency(output, "PING")
-            return {"bulk_pipeline_ops_per_sec": result.rps}
+            self.reset_module_measurement()
+            clock_offset_us = self.calibrate_server_clock_offset_us()
+            self.start_bulk()
+            self.wait_for_bulk_traffic()
+            before_stats = self.module_stats()
+            bulk_before = before_stats.get("bulk_commands_executed", 0)
+            with pinned_to(self.layout.short):
+                before = self.total_commands_processed()
+                started = time.monotonic()
+                self.short_run(MIXED_GUARD_SHORT_REQUESTS, "hol-short", clock_offset_us)
+                elapsed = time.monotonic() - started
+                after = self.total_commands_processed()
+            if self.bulk_proc is None or self.bulk_proc.poll() is not None:
+                raise BenchError("sustained bulk pipeline benchmark ended before the mixed throughput guard completed")
+            if elapsed <= 0.0 or after <= before:
+                raise BenchError("mixed throughput guard did not advance server command counters")
+            stats = self.module_stats()
+            bulk_after = stats.get("bulk_commands_executed", 0)
+            self.require_stat(stats, "bulk_client_count", BULK_CLIENTS)
+            self.require_stat(stats, "short_client_count", 1)
+            self.require_stat(stats, "short_commands_executed", MIXED_GUARD_SHORT_REQUESTS)
+            self.require_stat(stats, "short_enqueue_to_execution_samples", MIXED_GUARD_SHORT_REQUESTS)
+            if stats.get("delay_samples_dropped", 0) != 0:
+                raise BenchError("instrumentation dropped short delay samples during the mixed throughput guard")
+            if bulk_after <= bulk_before:
+                raise BenchError("bulk clients made no progress during the mixed throughput guard")
+            self.stop_bulk()
+            return {
+                "mixed_total_ops_per_sec": (after - before) / elapsed,
+                "mixed_bulk_ops_per_sec": (bulk_after - bulk_before) / elapsed,
+            }
         finally:
             self.close()
 
@@ -697,34 +719,20 @@ class IothreadHolBenchmark:
                 bulk_connections.append(self.connection(timeout=30.0))
             short_connection = self.connection(timeout=30.0)
 
-            # Tag a complete native-shaped pipeline for module accounting.
+            # Queue complete native-shaped pipelines, then place the short stream
+            # behind them before reading any bulk replies. This makes the ordering
+            # and completion check exercise the contested lane rather than a drain
+            # that has already finished.
             tracked_payload = b"".join(
                 resp_command(("PING", "hol-bulk")) for _ in range(BULK_PIPELINE)
             )
-            for connection in bulk_connections:
-                connection.send_raw(tracked_payload)
-            for connection in bulk_connections:
-                for _ in range(BULK_PIPELINE):
-                    if expect_text(connection.read(), "tracked bulk PING") != "hol-bulk":
-                        raise BenchError("tracked bulk PING returned an unexpected reply")
-
-            # Separately check per-client reply ordering with distinct values.
             commands_per_client = 64
             for client_id, connection in enumerate(bulk_connections):
-                payload = b"".join(
+                ordered_payload = b"".join(
                     resp_command(("ECHO", f"bulk:{client_id}:{sequence}"))
                     for sequence in range(commands_per_client)
                 )
-                connection.send_raw(payload)
-            for client_id, connection in enumerate(bulk_connections):
-                for sequence in range(commands_per_client):
-                    expected = f"bulk:{client_id}:{sequence}"
-                    actual = expect_text(connection.read(), "bulk ECHO")
-                    if actual != expected:
-                        raise BenchError(
-                            f"bulk client {client_id} reply order changed: "
-                            f"expected {expected!r}, got {actual!r}"
-                        )
+                connection.send_raw(tracked_payload + ordered_payload)
 
             clock_offset_us = self.calibrate_server_clock_offset_us()
             assert short_connection is not None
@@ -735,6 +743,19 @@ class IothreadHolBenchmark:
                 actual = expect_text(short_connection.read(), "short ECHO")
                 if actual != token:
                     raise BenchError(f"short client reply changed: expected {token!r}, got {actual!r}")
+
+            for client_id, connection in enumerate(bulk_connections):
+                for _ in range(BULK_PIPELINE):
+                    if expect_text(connection.read(), "tracked bulk PING") != "hol-bulk":
+                        raise BenchError("tracked bulk PING returned an unexpected reply")
+                for sequence in range(commands_per_client):
+                    expected = f"bulk:{client_id}:{sequence}"
+                    actual = expect_text(connection.read(), "bulk ECHO")
+                    if actual != expected:
+                        raise BenchError(
+                            f"bulk client {client_id} reply order changed: "
+                            f"expected {expected!r}, got {actual!r}"
+                        )
 
             stats = self.module_stats()
             self.require_stat(stats, "bulk_client_count", BULK_CLIENTS)
@@ -768,9 +789,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("mixed", "throughput"),
+        choices=("mixed", "mixed-throughput"),
         default="mixed",
-        help="run the mixed proof selector or the standalone throughput guard",
+        help="run the mixed proof selector or the mixed throughput guard",
     )
     parser.add_argument(
         "--verify",
@@ -785,8 +806,12 @@ def main() -> int:
             bench.verify()
             print("iothread-hol-verification: PASS")
             return 0
-        metrics = bench.measure_mixed() if args.mode == "mixed" else bench.measure_throughput()
-        names = MIXED_METRICS if args.mode == "mixed" else ("bulk_pipeline_ops_per_sec",)
+        if args.mode == "mixed":
+            metrics = bench.measure_mixed()
+            names = MIXED_METRICS
+        elif args.mode == "mixed-throughput":
+            metrics = bench.measure_mixed_throughput()
+            names = MIXED_THROUGHPUT_METRICS
         for name in names:
             print(json.dumps({"metric": name, "value": metrics[name]}, separators=(",", ":")))
         return 0
