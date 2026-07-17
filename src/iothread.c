@@ -572,7 +572,7 @@ int processClientsFromIOThread(IOThread *t) {
     /* A requeued pipeline keeps this list nonempty, so bound the number of
      * client slices before returning to the event loop. */
     while (listLength(mainThreadProcessingClients[t->id]) &&
-           processed < IO_THREAD_MAX_PENDING_CLIENTS) {
+           processed < IO_THREAD_MAX_PENDING_CLIENTS * 2) {
         if (prefetch_clients <= 0) {
             /* Reset the prefetching batch if we have processed all clients. */
             resetCommandsBatch();
@@ -619,7 +619,7 @@ int processClientsFromIOThread(IOThread *t) {
         if (runClientCronFromIOThread(c)) continue;
 
         /* Process the pending command and input buffer. */
-        unsigned long long commands_before = c->commands_processed;
+        int command_limit_reached = 0;
         if (!isClientReadErrorFatal(c) &&
             ((c->io_flags & CLIENT_IO_PENDING_COMMAND) ||
              c->pending_cmds.ready_len ||
@@ -633,7 +633,11 @@ int processClientsFromIOThread(IOThread *t) {
                 c->flags |= CLIENT_PENDING_COMMAND;
                 c->io_flags &= ~CLIENT_IO_PENDING_COMMAND;
             }
-            if (processPendingCommandAndInputBuffer(c, IO_THREAD_MAIN_THREAD_COMMAND_QUANTUM) == C_ERR) {
+            /* A master can defer its ready input while a long command yields.
+             * Preserve its existing IO-thread handoff behavior. */
+            int command_limit = (c->flags & CLIENT_MASTER) ? 0 :
+                                IO_THREAD_MAIN_THREAD_COMMAND_QUANTUM;
+            if (processPendingCommandAndInputBuffer(c, command_limit, &command_limit_reached) == C_ERR) {
                 /* If the client is no longer valid, it must be freed safely. */
                 continue;
             }
@@ -657,12 +661,12 @@ int processClientsFromIOThread(IOThread *t) {
          * beforeSleep */
         if (c->flags & CLIENT_SLAVE) continue;
 
-        /* A pipelined client keeps its position in the handoff lane, but yields
-         * after a bounded command slice. Re-linking it at the tail preserves
-         * that client's command order while allowing other clients to run. */
-        if (!(c->flags & (CLIENT_CLOSE_ASAP | CLIENT_CLOSE_AFTER_REPLY)) &&
-            (c->pending_cmds.ready_len ||
-             (c->commands_processed > commands_before && c->querybuf && sdslen(c->querybuf) > 0)))
+        /* A client that exhausted its command slice keeps its position in the
+         * handoff lane, but yields. Re-linking it at the tail preserves that
+         * client's command order while allowing other clients to run. */
+        if (command_limit_reached &&
+            !(c->flags & (CLIENT_CLOSE_ASAP | CLIENT_CLOSE_AFTER_REPLY | CLIENT_MASTER)) &&
+            (c->pending_cmds.ready_len || (c->querybuf && sdslen(c->querybuf) > 0)))
         {
             if (c->flags & CLIENT_PENDING_WRITE) {
                 c->flags &= ~CLIENT_PENDING_WRITE;

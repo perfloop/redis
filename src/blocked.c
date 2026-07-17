@@ -146,7 +146,7 @@ void processUnblockedClients(void) {
          * the code is conceptually more correct this way. */
         if (!(c->flags & CLIENT_BLOCKED)) {
             /* If we have a queued command, execute it now. */
-            if (processPendingCommandAndInputBuffer(c, 0) == C_ERR) {
+            if (processPendingCommandAndInputBuffer(c, 0, NULL) == C_ERR) {
                 c = NULL;
             }
         }

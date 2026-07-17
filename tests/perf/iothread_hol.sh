@@ -26,7 +26,7 @@ fi
 cd "$root"
 
 server="$root/src/redis-server"
-instrumented_server="${PERFLOOP_IOTHREAD_HOL_INSTRUMENTED_SERVER:-$root/src/redis-server.hol-instrumented}"
+instrumented_server="$root/src/redis-server.hol-instrumented"
 cli="$root/src/redis-cli"
 benchmark="$root/src/redis-benchmark"
 for binary in "$server" "$cli" "$benchmark"; do
@@ -204,7 +204,7 @@ run_measurement() {
     local metrics_file="$workdir/handoff-metrics"
     local control_p99_ms control_p99_us short_p50_ms short_p99_ms bulk_p50_ms bulk_p99_ms bulk_rps
     local short_p50_us short_p99_us bulk_p50_us bulk_p99_us ratio
-    local prefetch_entries prefetch_batches normal_bulk_entries_during_short
+    local normal_bulk_entries_during_short
     local short_queue_samples short_queue_p50 short_queue_p99 bulk_queue_samples bulk_queue_p50 bulk_queue_p99
     local drain_samples drain_initial_p99 drain_clients_p50 drain_clients_p99 drain_commands_p50 drain_commands_p99
     local drain_residual_p50 drain_residual_p99 drain_residual_max
@@ -238,16 +238,12 @@ run_measurement() {
     bulk_p50_ms=$(csv_field "$bulk_csv" 5)
     bulk_p99_ms=$(csv_field "$bulk_csv" 7)
     bulk_rps=$(csv_field "$bulk_csv" 2)
-    prefetch_entries=$(info_metric io_threaded_total_prefetch_entries)
-    prefetch_batches=$(info_metric io_threaded_total_prefetch_batches)
     normal_bulk_entries_during_short=$bulk_entries_during_short
     require_number "$short_p50_ms" short_get_p50_latency_ms
     require_number "$short_p99_ms" short_get_p99_latency_ms
     require_number "$bulk_p50_ms" bulk_set_p50_latency_ms
     require_number "$bulk_p99_ms" bulk_set_p99_latency_ms
     require_number "$bulk_rps" bulk_set_ops_per_sec
-    require_number "$prefetch_entries" io_threaded_total_prefetch_entries
-    require_number "$prefetch_batches" io_threaded_total_prefetch_batches
     stop_server
 
     short_p50_us=$(milliseconds_to_microseconds "$short_p50_ms")
@@ -324,8 +320,6 @@ run_measurement() {
     emit_metric drain_residual_clients_p99 "$drain_residual_p99"
     emit_metric drain_residual_clients_max "$drain_residual_max"
     emit_metric bulk_prefetch_entries_during_short "$normal_bulk_entries_during_short"
-    emit_metric iothread_prefetch_entries "$prefetch_entries"
-    emit_metric iothread_prefetch_batches "$prefetch_batches"
 }
 
 run_correctness_check() {

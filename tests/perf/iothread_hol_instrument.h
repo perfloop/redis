@@ -10,7 +10,6 @@
 
 #include "server.h"
 
-#include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdatomic.h>
@@ -20,7 +19,6 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
-#include <unistd.h>
 
 #define HOL_CLIENT_SLOTS 1024
 #define HOL_QUEUE_SAMPLES 65536
@@ -268,7 +266,6 @@ static void hol_write_snapshot(void) {
     file = fopen(hol_metrics_path, "w");
     if (file == NULL) return;
 
-    hol_write_metric(file, "format_version", 1);
     hol_write_metric(file, "short_queue_delay_samples", hol_short_delay_count);
     hol_write_metric(file, "short_queue_delay_p50_us",
                      hol_quantile(hol_short_delays, hol_short_delay_count, HOL_QUEUE_SAMPLES, 50));
