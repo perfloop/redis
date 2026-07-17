@@ -65,6 +65,7 @@ MIXED_METRICS = (
     "bulk_pipeline_p50_latency_us",
     "bulk_pipeline_p99_latency_us",
     "mixed_total_ops_per_sec",
+    "scheduler_invocation_count",
     "scheduler_clients_per_invocation_max",
     "scheduler_commands_per_invocation_max",
     "scheduler_residual_queue_depth_after_invocation_max",
@@ -664,6 +665,7 @@ class IothreadHolBenchmark:
                 "bulk_pipeline_p50_latency_us": bulk.p50_us,
                 "bulk_pipeline_p99_latency_us": bulk.p99_us,
                 "mixed_total_ops_per_sec": (after - before) / elapsed,
+                "scheduler_invocation_count": float(stats["scheduler_invocation_count"]),
                 "scheduler_clients_per_invocation_max": float(stats["scheduler_clients_per_invocation_max"]),
                 "scheduler_commands_per_invocation_max": float(stats["scheduler_commands_per_invocation_max"]),
                 "scheduler_residual_queue_depth_after_invocation_max": float(
