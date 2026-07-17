@@ -563,9 +563,10 @@ int processClientsFromIOThread(IOThread *t) {
     int has_residual = listLength(mainThreadProcessingClients[t->id]) != 0;
     int has_pending = listLength(mainThreadPendingClients[t->id]) != 0;
     if (has_residual && has_pending) {
-        /* Shorten a contended turn so fresh work gets an earlier next turn.
-         * Without new work, a second batch amortizes handoff overhead. */
-        client_slice_limit = IO_THREAD_MAX_PENDING_CLIENTS;
+        /* Shorten a contended turn so fresh work gets an earlier next turn,
+         * while still completing a batch and a half for bulk reply latency. */
+        client_slice_limit = IO_THREAD_MAX_PENDING_CLIENTS +
+                             IO_THREAD_MAX_PENDING_CLIENTS / 2;
         if (mainThreadPreferNewClients[t->id]) {
             listJoin(mainThreadPendingClients[t->id], mainThreadProcessingClients[t->id]);
         }
@@ -647,9 +648,9 @@ int processClientsFromIOThread(IOThread *t) {
                 c->flags |= CLIENT_PENDING_COMMAND;
                 c->io_flags &= ~CLIENT_IO_PENDING_COMMAND;
             }
-            /* A master can defer its ready input while a long command yields.
-             * Preserve its existing IO-thread handoff behavior. */
-            int command_limit = (c->flags & CLIENT_MASTER) ? 0 :
+            /* Replication peers can defer ready input while a long command
+             * yields. Preserve their existing unbounded handoff behavior. */
+            int command_limit = (c->flags & (CLIENT_MASTER | CLIENT_SLAVE)) ? 0 :
                                 IO_THREAD_MAIN_THREAD_COMMAND_QUANTUM;
             if (processPendingCommandAndInputBuffer(c, command_limit, &command_limit_reached) == C_ERR) {
                 /* If the client is no longer valid, it must be freed safely. */
@@ -676,8 +677,9 @@ int processClientsFromIOThread(IOThread *t) {
             continue;
         }
 
-        /* Handle replica clients in putReplicasInPendingClientsToIOThreads in
-         * beforeSleep */
+        /* Replication peers use the unbounded path above; hand their fully
+         * drained client back through putReplicasInPendingClientsToIOThreads
+         * in beforeSleep. */
         if (c->flags & CLIENT_SLAVE) continue;
 
         /* A client that exhausted its command slice keeps its position in the
