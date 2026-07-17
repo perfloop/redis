@@ -289,9 +289,10 @@ class RedisServer:
 
 class IothreadHolBenchmark:
     def __init__(self, source_dir: Path, module_binary: Path):
-        self.source_dir = source_dir
-        self.server = source_dir / "redis-server"
-        self.benchmark = source_dir / "redis-benchmark"
+        self.source_dir = source_dir.resolve()
+        self.server = self.source_dir / "redis-server"
+        self.benchmark = self.source_dir / "redis-benchmark"
+        module_binary = module_binary.resolve()
         for binary in (self.server, self.benchmark, module_binary):
             if not binary.is_file() or not os.access(binary, os.X_OK):
                 raise BenchError(f"missing executable: {binary}")
