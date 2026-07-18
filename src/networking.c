@@ -184,6 +184,9 @@ client *createClient(connection *conn) {
     c->cur_script = NULL;
     c->multibulklen = 0;
     c->bulklen = -1;
+    c->parse_continuation_id = AE_ERR;
+    c->parse_continuation_tid = IOTHREAD_MAIN_THREAD_ID;
+    c->parse_continuation_pending = 0;
     c->sentlen = 0;
     c->flags = 0;
     c->io_flags = CLIENT_IO_READ_ENABLED | CLIENT_IO_WRITE_ENABLED;
@@ -2158,6 +2161,63 @@ static void releaseAllBufReferences(client *c) {
     }
 }
 
+static aeEventLoop *getClientParseEventLoop(client *c) {
+    if (c->running_tid == IOTHREAD_MAIN_THREAD_ID) return server.el;
+    return IOThreads[c->running_tid].el;
+}
+
+void cancelClientParseContinuation(client *c) {
+    if (c->parse_continuation_id != AE_ERR) {
+        serverAssert(c->parse_continuation_tid == c->running_tid);
+        serverAssert(aeDeleteTimeEvent(getClientParseEventLoop(c),
+                                        c->parse_continuation_id) == AE_OK);
+        c->parse_continuation_id = AE_ERR;
+    }
+    c->parse_continuation_pending = 0;
+}
+
+/* The source owner removes its timer before moving a client to another event
+ * loop. The destination owner recreates it after the handoff is complete. */
+void deferClientParseContinuation(client *c) {
+    if (c->parse_continuation_id == AE_ERR) return;
+
+    serverAssert(c->parse_continuation_tid == c->running_tid);
+    serverAssert(aeDeleteTimeEvent(getClientParseEventLoop(c),
+                                    c->parse_continuation_id) == AE_OK);
+    c->parse_continuation_id = AE_ERR;
+    c->parse_continuation_pending = 1;
+}
+
+static int processClientParseContinuation(aeEventLoop *eventLoop, long long id, void *clientData) {
+    client *c = clientData;
+
+    serverAssert(c->parse_continuation_id == id);
+    serverAssert(c->parse_continuation_tid == c->running_tid);
+    serverAssert(eventLoop == getClientParseEventLoop(c));
+    c->parse_continuation_id = AE_ERR;
+    if (processInputBuffer(c) == C_ERR) return AE_NOMORE;
+    beforeNextClient(c);
+    return AE_NOMORE;
+}
+
+static int scheduleClientParseContinuation(client *c) {
+    serverAssert(c->parse_continuation_id == AE_ERR);
+    serverAssert(!c->parse_continuation_pending);
+    c->parse_continuation_tid = c->running_tid;
+    c->parse_continuation_id = aeCreateTimeEvent(
+        getClientParseEventLoop(c), 0, processClientParseContinuation, c, NULL);
+    return c->parse_continuation_id == AE_ERR ? AE_ERR : AE_OK;
+}
+
+int resumeClientParseContinuation(client *c) {
+    if (!c->parse_continuation_pending) return C_OK;
+
+    serverAssert(c->parse_continuation_id == AE_ERR);
+    c->parse_continuation_pending = 0;
+    if (scheduleClientParseContinuation(c) == AE_OK) return C_OK;
+    return processInputBuffer(c);
+}
+
 void freeClient(client *c) {
     listNode *ln;
 
@@ -2172,6 +2232,7 @@ void freeClient(client *c) {
     if (c->running_tid != IOTHREAD_MAIN_THREAD_ID) {
         fetchClientFromIOThread(c);
     }
+    cancelClientParseContinuation(c);
 
     /* We need to unbind connection of client from io thread event loop first. */
     if (c->tid != IOTHREAD_MAIN_THREAD_ID) {
@@ -3220,6 +3281,7 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
     char *newline = NULL;
     int ok;
     long long ll;
+    int parsed_args = 0;
     size_t querybuf_len = sdslen(c->querybuf); /* Cache sdslen */
 
     if (c->multibulklen == 0) {
@@ -3410,6 +3472,11 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
             }
             c->bulklen = -1;
             c->multibulklen--;
+            if (++parsed_args == PROTO_MBULK_PARSE_QUANTUM && c->multibulklen &&
+                scheduleClientParseContinuation(c) == AE_OK)
+            {
+                break;
+            }
         }
     }
 
@@ -3540,6 +3607,9 @@ int processPendingCommandAndInputBuffer(client *c) {
      * Note: when a master client steps into this function,
      * it can always satisfy this condition, because its querybuf
      * contains data not applied. */
+    if (c->parse_continuation_pending) {
+        return resumeClientParseContinuation(c);
+    }
     if ((c->querybuf && sdslen(c->querybuf) > 0) || c->pending_cmds.ready_len > 0) {
         return processInputBuffer(c);
     }
@@ -3631,6 +3701,11 @@ int isClientReadErrorFatal(client *c) {
 int processInputBuffer(client *c) {
     atomicIncr(server.stat_total_client_process_input_buff_events, 1);
 
+    /* A yielded multibulk command owns the next parsing turn. Socket reads may
+     * append more data before that turn, but must not parse it synchronously. */
+    if (c->parse_continuation_id != AE_ERR ||
+        c->parse_continuation_pending) return C_OK;
+
     /* Keep active-client window updates on main-thread paths only (here and
      * in IO-thread handoff processing) to avoid races with serverCron()
      * maintenance of the circular slots. */
@@ -3648,6 +3723,11 @@ int processInputBuffer(client *c) {
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->pending_cmds.ready_len > 0)
     {
+        /* A ready command parsed before a yield may execute below, but no later
+         * loop turn may resume the yielded command before its continuation. */
+        if (c->parse_continuation_id != AE_ERR ||
+            c->parse_continuation_pending) break;
+
         /* Immediately abort if the client is in the middle of something. */
         if (c->flags & CLIENT_BLOCKED || c->flags & CLIENT_UNBLOCKED) break;
 

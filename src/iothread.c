@@ -107,6 +107,10 @@ int runClientCronFromIOThread(client *c) {
  * should remove it from its clients list and put the client in the list to main
  * thread, we will send these clients to main thread in IOThreadBeforeSleep. */
 void enqueuePendingClientsToMainThread(client *c, int unbind) {
+    /* A parser turn cannot stay registered on an event loop after its client
+     * enters the main-thread handoff queue. */
+    deferClientParseContinuation(c);
+
     /* If the IO thread may no longer manage it, such as closing client, we should
      * unbind client from event loop, so main thread doesn't need to do it costly. */
     if (unbind) connUnbindEventLoop(c->conn);
@@ -150,6 +154,7 @@ void enqueuePendingClienstToIOThreads(client *c) {
         c->io_lastinteraction = c->lastinteraction;
     }
 
+    deferClientParseContinuation(c);
     c->running_tid = c->tid;
     listAddNodeHead(mainThreadPendingClientsToIOThreads[c->tid], c);
 }
@@ -197,6 +202,7 @@ void fetchClientFromIOThread(client *c) {
     serverAssert(c->tid != IOTHREAD_MAIN_THREAD_ID &&
                  c->running_tid != IOTHREAD_MAIN_THREAD_ID);
     pauseIOThread(c->tid);
+    cancelClientParseContinuation(c);
     /* Remove the client from clients list of IO thread or main thread. */
     if (c->io_thread_client_list_node) {
         listDelNode(IOThreads[c->tid].clients, c->io_thread_client_list_node);
@@ -647,6 +653,7 @@ int processClientsFromIOThread(IOThread *t) {
             c->flags &= ~CLIENT_PENDING_WRITE;
             listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         }
+        deferClientParseContinuation(c);
         c->running_tid = c->tid;
         listLinkNodeHead(mainThreadPendingClientsToIOThreads[c->tid], node);
         node = NULL;
@@ -772,6 +779,10 @@ int processClientsFromMainThread(IOThread *t) {
             if (!(c->io_flags & CLIENT_IO_CLOSE_ASAP) && clientHasPendingReplies(c)) {
                 connSetWriteHandler(c->conn, sendReplyToClient);
             }
+        }
+
+        if (resumeClientParseContinuation(c) == C_ERR) {
+            enqueuePendingClientsToMainThread(c, 1);
         }
     }
     /* All clients must are processed. */
