@@ -109,6 +109,7 @@ int runClientCronFromIOThread(client *c) {
 void enqueuePendingClientsToMainThread(client *c, int unbind) {
     /* If the IO thread may no longer manage it, such as closing client, we should
      * unbind client from event loop, so main thread doesn't need to do it costly. */
+    dequeueClientInputBufferContinuation(c);
     if (unbind) connUnbindEventLoop(c->conn);
     /* Just skip if it already is transferred. */
     if (c->io_thread_client_list_node) {
@@ -197,6 +198,7 @@ void fetchClientFromIOThread(client *c) {
     serverAssert(c->tid != IOTHREAD_MAIN_THREAD_ID &&
                  c->running_tid != IOTHREAD_MAIN_THREAD_ID);
     pauseIOThread(c->tid);
+    dequeueClientInputBufferContinuation(c);
     /* Remove the client from clients list of IO thread or main thread. */
     if (c->io_thread_client_list_node) {
         listDelNode(IOThreads[c->tid].clients, c->io_thread_client_list_node);
@@ -283,6 +285,7 @@ int isClientMustHandledByMainThread(client *c) {
  * it assigns the client to the IO thread with the fewest clients. */
 void assignClientToIOThread(client *c) {
     serverAssert(c->tid == IOTHREAD_MAIN_THREAD_ID);
+    dequeueClientInputBufferContinuation(c);
     /* Find the IO thread with the fewest clients. */
     int min_id = 0;
     int min = INT_MAX;
@@ -634,6 +637,8 @@ int processClientsFromIOThread(IOThread *t) {
          * race will happen, since we may touch client's data in main thread. */
         if (isClientMustHandledByMainThread(c)) {
             keepClientInMainThread(c);
+            if (clientHasPendingInputBufferContinuation(c))
+                queueClientInputBufferContinuation(c);
             continue;
         }
 
@@ -758,6 +763,9 @@ int processClientsFromMainThread(IOThread *t) {
         /* Enable read and write and reset some flags. */
         c->io_flags |= CLIENT_IO_READ_ENABLED | CLIENT_IO_WRITE_ENABLED;
         c->io_flags &= ~(CLIENT_IO_PENDING_COMMAND | CLIENT_IO_PENDING_CRON);
+
+        if (clientHasPendingInputBufferContinuation(c))
+            queueClientInputBufferContinuation(c);
 
         /* Only bind once, we never remove read handler unless freeing client. */
         if (!connHasEventLoop(c->conn)) {
@@ -895,6 +903,8 @@ void initThreadedIO(void) {
         t->processing_clients = listCreate();
         t->pending_clients_to_main_thread = listCreate();
         t->clients = listCreate();
+        t->clients_pending_read = listCreate();
+        t->clients_pending_read_scheduled = 0;
         atomicSetWithSync(t->paused, IO_THREAD_UNPAUSED);
         atomicSetWithSync(t->running, 0);
 

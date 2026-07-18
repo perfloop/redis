@@ -190,6 +190,7 @@ struct hdr_histogram;
 #define PROTO_REPLY_CHUNK_BYTES (16*1024) /* 16k output buffer */
 #define PROTO_INLINE_MAX_SIZE   (1024*64) /* Max size of inline reads */
 #define PROTO_MBULK_BIG_ARG     (1024*32)
+#define PROTO_MBULK_PARSE_MAX_ARGS (1024*8) /* Max fully buffered multibulk arguments parsed per event loop turn. */
 #define PROTO_RESIZE_THRESHOLD  (1024*32) /* Threshold for determining whether to resize query buffer */
 #define PROTO_REPLY_MIN_BYTES   (1024) /* the lower limit on reply buffer size */
 #define REDIS_AUTOSYNC_BYTES (1024*1024*4) /* Sync file every 4MB. */
@@ -447,6 +448,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define CLIENT_INTERNAL (1ULL<<52) /* Internal client connection */
 #define CLIENT_ASM_MIGRATING (1ULL<<53) /* Client is migrating RDB/stream data during atomic slot migration. */
 #define CLIENT_ASM_IMPORTING (1ULL<<54) /* Client is importing RDB/stream data during atomic slot migration. */
+#define CLIENT_PENDING_PARSE (1ULL<<55) /* Client has a buffered multibulk parse continuation. */
 
 /* Any flag that does not let optimize FLUSH SYNC to run it in bg as blocking client ASYNC */
 #define CLIENT_AVOID_BLOCKING_ASYNC_FLUSH (CLIENT_DENY_BLOCKING|CLIENT_MULTI|CLIENT_LUA_DEBUG|CLIENT_LUA_DEBUG_SYNC|CLIENT_MODULE)
@@ -1491,6 +1493,7 @@ typedef struct client {
     connection *conn;
     uint8_t tid;            /* Thread assigned ID this client is bound to. */
     uint8_t running_tid;    /* Thread assigned ID this client is running on. */
+    uint8_t pending_parse_tid; /* Event loop that owns a buffered parse continuation. */
     uint8_t io_flags;       /* Accessed by both main and IO threads, but not modified concurrently */
     uint8_t read_error;     /* Client read error: CLIENT_READ_* macros. */
     int resp;               /* RESP protocol version. Can be 2 or 3. */
@@ -1644,6 +1647,8 @@ typedef struct client {
 
     /* list node in clients_pending_write list */
     listNode clients_pending_write_node;
+    /* list node in clients_pending_read list */
+    listNode clients_pending_read_node;
     /* list node in clients_with_pending_ref_reply list */
     listNode pending_ref_reply_node;
     /* Statistics and metrics */
@@ -1690,6 +1695,8 @@ typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) {
     pthread_mutex_t pending_clients_mutex;      /* Mutex for pending write list */
     list *pending_clients_to_main_thread;       /* Clients that are waiting to be executed by the main thread. */
     list *clients;                              /* IO thread managed clients. */
+    list *clients_pending_read;                 /* Buffered input parsing continuations. */
+    int clients_pending_read_scheduled;         /* A parse continuation timer is queued. */
     redisAtomic long long io_reads_processed;   /* Number of read events processed */
     redisAtomic long long io_writes_processed;  /* Number of write events processed */
 } IOThread;
@@ -2083,7 +2090,8 @@ struct redisServer {
     list *clients;              /* List of active clients */
     list *clients_to_close;     /* Clients to close asynchronously */
     list *clients_pending_write; /* There is to write or install handler. */
-    list *clients_pending_read;  /* Client has pending read socket buffers. */
+    list *clients_pending_read;  /* Buffered input parsing continuations. */
+    int clients_pending_read_scheduled; /* A main-loop parse continuation timer is queued. */
     list *clients_with_pending_ref_reply; /* Clients with referenced reply objects. */
     list *slaves, *monitors;    /* List of slaves and MONITORs */
     client *current_client;     /* The client that triggered the command execution (External or AOF). */
@@ -2711,6 +2719,7 @@ enum {
     PENDING_CMD_FLAG_PREPROCESSED = 1 << 1,   /* This command has passed pre-processing */
     PENDING_CMD_KEYS_RESULT_VALID = 1 << 2,   /* Command's keys_result is valid and cached */
     PENDING_CMD_KEYS_PREFETCHED = 1 << 3,     /* Command's keys were prefetched by the cross-command batch */
+    PENDING_CMD_FLAG_YIELDED = 1 << 4,        /* Parsing stopped at the per-event argument quantum */
 };
 
 /* Parser state and parse result of a command from a client's input buffer. */
@@ -3231,6 +3240,9 @@ void redisSetCpuAffinity(const char *cpulist);
 client *createClient(connection *conn);
 void freeClient(client *c);
 void freeClientAsync(client *c);
+void dequeueClientInputBufferContinuation(client *c);
+void queueClientInputBufferContinuation(client *c);
+int clientHasPendingInputBufferContinuation(client *c);
 void deauthenticateAndCloseClient(client *c);
 void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...);
 int beforeNextClient(client *c);

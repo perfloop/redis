@@ -3004,6 +3004,7 @@ void initServer(void) {
     server.monitors = listCreate();
     server.clients_pending_write = listCreate();
     server.clients_pending_read = listCreate();
+    server.clients_pending_read_scheduled = 0;
     server.clients_with_pending_ref_reply = listCreate();
     /* clients_timeout_table key = 8 bytes BE mstime + 8 bytes client ID
      * (see CLIENT_ST_KEYLEN / encodeTimeoutKey in timeout.c). */

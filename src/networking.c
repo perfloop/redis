@@ -38,6 +38,7 @@ static inline int _writeToClientSlave(client *c, ssize_t *nwritten);
 static pendingCommand *acquirePendingCommand(void);
 static inline void reclaimPendingCommand(client *c, pendingCommand *pcmd);
 static size_t getClientOutputBufferLogicalSize(client *c);
+void queueClientInputBufferContinuation(client *c);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 __thread sds thread_reusable_qb = NULL;
@@ -98,6 +99,89 @@ void linkClient(client *c) {
     raxInsert(server.clients_index,(unsigned char*)&id,sizeof(id),c,NULL);
 }
 
+static list *getClientsPendingRead(uint8_t tid) {
+    return tid == IOTHREAD_MAIN_THREAD_ID ? server.clients_pending_read :
+                                            IOThreads[tid].clients_pending_read;
+}
+
+static int *getClientsPendingReadScheduled(uint8_t tid) {
+    return tid == IOTHREAD_MAIN_THREAD_ID ? &server.clients_pending_read_scheduled :
+                                            &IOThreads[tid].clients_pending_read_scheduled;
+}
+
+static aeEventLoop *getClientEventLoop(uint8_t tid) {
+    return tid == IOTHREAD_MAIN_THREAD_ID ? server.el : IOThreads[tid].el;
+}
+
+static int processClientInputBufferContinuation(aeEventLoop *el, long long id, void *data);
+
+static void scheduleClientInputBufferContinuation(uint8_t tid) {
+    int *scheduled = getClientsPendingReadScheduled(tid);
+    if (*scheduled) return;
+
+    *scheduled = 1;
+    IOThread *t = tid == IOTHREAD_MAIN_THREAD_ID ? NULL : &IOThreads[tid];
+    if (aeCreateTimeEvent(getClientEventLoop(tid), 0,
+                          processClientInputBufferContinuation, t, NULL) == AE_ERR)
+    {
+        serverPanic("Unable to schedule client input buffer continuation");
+    }
+}
+
+void dequeueClientInputBufferContinuation(client *c) {
+    if (!(c->flags & CLIENT_PENDING_PARSE)) return;
+
+    listUnlinkNode(getClientsPendingRead(c->pending_parse_tid),
+                   &c->clients_pending_read_node);
+    c->flags &= ~CLIENT_PENDING_PARSE;
+}
+
+int clientHasPendingInputBufferContinuation(client *c) {
+    return c->pending_cmds.len != c->pending_cmds.ready_len &&
+           c->pending_cmds.tail->flags & PENDING_CMD_FLAG_YIELDED;
+}
+
+void queueClientInputBufferContinuation(client *c) {
+    /* A client temporarily handed from an IO thread to the main thread is
+     * returned to its IO event loop below. Queue its continuation there after
+     * that handoff, rather than touching the IO-thread queue from here. */
+    if (c->running_tid == IOTHREAD_MAIN_THREAD_ID &&
+        c->tid != IOTHREAD_MAIN_THREAD_ID)
+    {
+        return;
+    }
+
+    if (c->flags & (CLIENT_PENDING_PARSE | CLIENT_CLOSE_ASAP)) return;
+
+    c->pending_parse_tid = c->running_tid;
+    c->flags |= CLIENT_PENDING_PARSE;
+    listLinkNodeTail(getClientsPendingRead(c->pending_parse_tid),
+                     &c->clients_pending_read_node);
+    scheduleClientInputBufferContinuation(c->pending_parse_tid);
+}
+
+static int processClientInputBufferContinuation(aeEventLoop *el, long long id, void *data) {
+    UNUSED(el);
+    UNUSED(id);
+
+    IOThread *t = data;
+    uint8_t tid = t ? t->id : IOTHREAD_MAIN_THREAD_ID;
+    list *clients = getClientsPendingRead(tid);
+    *getClientsPendingReadScheduled(tid) = 0;
+
+    listNode *ln = listFirst(clients);
+    if (ln) {
+        client *c = listNodeValue(ln);
+        serverAssert(c->running_tid == tid);
+        dequeueClientInputBufferContinuation(c);
+        if (processInputBuffer(c) == C_ERR) c = NULL;
+        beforeNextClient(c);
+    }
+
+    if (listLength(clients)) scheduleClientInputBufferContinuation(tid);
+    return AE_NOMORE;
+}
+
 /* Initialize client authentication state.
  */
 static void clientSetDefaultAuth(client *c) {
@@ -140,6 +224,7 @@ client *createClient(connection *conn) {
     c->id = client_id;
     c->tid = IOTHREAD_MAIN_THREAD_ID;
     c->running_tid = IOTHREAD_MAIN_THREAD_ID;
+    c->pending_parse_tid = IOTHREAD_MAIN_THREAD_ID;
     if (conn) server.io_threads_clients_num[c->tid]++;
 #ifdef LOG_REQ_RES
     reqresReset(c, 0);
@@ -241,6 +326,7 @@ client *createClient(connection *conn) {
     c->auth_callback_privdata = NULL;
     c->auth_module = NULL;
     listInitNode(&c->clients_pending_write_node, c);
+    listInitNode(&c->clients_pending_read_node, c);
     listInitNode(&c->pending_ref_reply_node, c);
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
@@ -1883,6 +1969,8 @@ void unlinkClient(client *c) {
     /* If this is marked as current client unset it. */
     if (c->conn && server.current_client == c) server.current_client = NULL;
 
+    dequeueClientInputBufferContinuation(c);
+
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
      * conn is already set to NULL. */
@@ -3220,7 +3308,10 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
     char *newline = NULL;
     int ok;
     long long ll;
+    int parsed_args = 0;
     size_t querybuf_len = sdslen(c->querybuf); /* Cache sdslen */
+
+    pcmd->flags &= ~PENDING_CMD_FLAG_YIELDED;
 
     if (c->multibulklen == 0) {
         /* The pending command should have been reset */
@@ -3303,7 +3394,7 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
     }
 
     serverAssertWithInfo(c,NULL,c->multibulklen > 0);
-    while(c->multibulklen) {
+    while(c->multibulklen && parsed_args < PROTO_MBULK_PARSE_MAX_ARGS) {
         /* Read bulk length if unknown */
         if (c->bulklen == -1) {
             newline = memchr(c->querybuf+c->qb_pos,'\r',sdslen(c->querybuf) - c->qb_pos);
@@ -3410,6 +3501,7 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
             }
             c->bulklen = -1;
             c->multibulklen--;
+            parsed_args++;
         }
     }
 
@@ -3421,8 +3513,11 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
         return C_OK;
     }
 
-    /* Still not ready to process the command */
+    /* Still not ready to process the command. Schedule a fresh event-loop turn
+     * only when the argument quantum left buffered input to consume. */
     pcmd->flags |= PENDING_CMD_FLAG_INCOMPLETE;
+    if (parsed_args == PROTO_MBULK_PARSE_MAX_ARGS && c->qb_pos < querybuf_len)
+        pcmd->flags |= PENDING_CMD_FLAG_YIELDED;
     return C_OK;
 }
 
@@ -3629,6 +3724,7 @@ int isClientReadErrorFatal(client *c) {
  * pending query buffer, already representing a full command, to process.
  * return C_ERR in case the client was freed during the processing */
 int processInputBuffer(client *c) {
+    dequeueClientInputBufferContinuation(c);
     atomicIncr(server.stat_total_client_process_input_buff_events, 1);
 
     /* Keep active-client window updates on main-thread paths only (here and
@@ -3714,8 +3810,11 @@ int processInputBuffer(client *c) {
             }
 
             addPendingCommand(&c->pending_cmds, pcmd);
-            if (unlikely(pcmd->read_error || (pcmd->flags & PENDING_CMD_FLAG_INCOMPLETE)))
+            if (unlikely(pcmd->read_error || (pcmd->flags & PENDING_CMD_FLAG_INCOMPLETE))) {
+                if (pcmd->flags & PENDING_CMD_FLAG_YIELDED)
+                    queueClientInputBufferContinuation(c);
                 break;
+            }
 
             if (c->running_tid == IOTHREAD_MAIN_THREAD_ID)
                 pcmd->reploff = c->read_reploff - sdslen(c->querybuf) + c->qb_pos;
