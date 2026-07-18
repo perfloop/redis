@@ -1,0 +1,68 @@
+--- a/src/networking.c
++++ b/src/networking.c
+@@ -26,6 +26,11 @@
+ #include <sys/uio.h>
+ #include <math.h>
+ #include <ctype.h>
++#ifdef PERFLOOP_PARSE_TRACE
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <time.h>
++#endif
+
+ static void setProtocolError(const char *errstr, client *c);
+ static void pauseClientsByClient(mstime_t end, int isPauseClientAll);
+@@ -39,6 +44,38 @@
+ static inline void reclaimPendingCommand(client *c, pendingCommand *pcmd);
+ static size_t getClientOutputBufferLogicalSize(client *c);
+
++#ifdef PERFLOOP_PARSE_TRACE
++#define PERFLOOP_PARSE_TRACE_CAPACITY (1U << 20)
++
++static uint64_t *perfloop_parse_trace;
++static size_t perfloop_parse_trace_count;
++
++static uint64_t perfloopParseTurnNowNs(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++
++static void perfloopTraceParseTurn(uint64_t elapsed_ns) {
++    if (!perfloop_parse_trace) {
++        const char *path = getenv("PERFLOOP_PARSE_TRACE");
++        if (!path) return;
++        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
++        if (fd == -1) return;
++        size_t bytes = PERFLOOP_PARSE_TRACE_CAPACITY * sizeof(*perfloop_parse_trace);
++        if (ftruncate(fd, bytes) == -1) {
++            close(fd);
++            return;
++        }
++        perfloop_parse_trace = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        close(fd);
++        if (perfloop_parse_trace == MAP_FAILED) perfloop_parse_trace = NULL;
++    }
++    if (perfloop_parse_trace && perfloop_parse_trace_count < PERFLOOP_PARSE_TRACE_CAPACITY)
++        perfloop_parse_trace[perfloop_parse_trace_count++] = elapsed_ns;
++}
++#endif
++
+ int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
+ __thread sds thread_reusable_qb = NULL;
+ __thread int thread_reusable_qb_used = 0; /* Avoid multiple clients using reusable query
+@@ -3703,7 +3740,14 @@
+                     pcmd = acquirePendingCommand();
+                 }
+
++#ifdef PERFLOOP_PARSE_TRACE
++                uint64_t parse_start_ns = perfloopParseTurnNowNs();
++                int parse_status = processMultibulkBuffer(c, pcmd);
++                perfloopTraceParseTurn(perfloopParseTurnNowNs() - parse_start_ns);
++                if (parse_status == C_ERR && !pcmd->read_error) {
++#else
+                 if (processMultibulkBuffer(c, pcmd) == C_ERR && !pcmd->read_error) {
++#endif
+                     /* If it fails but there are no errors, it means that it might just be
+                      * that the desired content cannot be parsed. At this point, we exit and wait for the next time. */
+                     freePendingCommand(c, pcmd);
