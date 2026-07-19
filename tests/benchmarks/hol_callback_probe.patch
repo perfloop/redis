@@ -1,0 +1,88 @@
+diff --git a/src/networking.c b/src/networking.c
+index ea3a4de..20ae225 100644
+--- a/src/networking.c
++++ b/src/networking.c
+@@ -26,7 +26,61 @@
+ #include <sys/uio.h>
+ #include <math.h>
+ #include <ctype.h>
++#include <fcntl.h>
+ 
++#ifdef PERFLOOP_HOL_CALLBACK_PROBE
++static int holCallbackProbeFd = -2;
++static uint64_t holCallbackProbeMax;
++static int holSmallPingWaitProbeFd = -2;
++static uint64_t holSmallPingWaitProbeMax;
++static client *holSmallPingWaitClient;
++static uint64_t holSmallPingWaitStartedUs;
++
++static void holProbeRecordMax(int *fd, uint64_t *maximum, const char *path_name, uint64_t value) {
++    if (value <= *maximum) return;
++    *maximum = value;
++    if (*fd == -2) {
++        const char *path = getenv(path_name);
++        *fd = path ? open(path, O_WRONLY | O_CREAT | O_APPEND, 0600) : -1;
++    }
++    if (*fd >= 0) {
++        char line[64];
++        int length = snprintf(line, sizeof(line), "%llu\n", (unsigned long long)value);
++        if (length > 0) write(*fd, line, (size_t)length);
++    }
++}
++
++static void holCallbackProbeFinish(monotime *started) {
++    holProbeRecordMax(&holCallbackProbeFd, &holCallbackProbeMax, "PERFLOOP_HOL_CALLBACK_PATH",
++                      elapsedUs(*started));
++}
++
++static void holSmallPingWaitProbeStart(client *c) {
++    static const char prefix[] = "PERFLOOP_HOL:";
++    const char *argument;
++    unsigned long long started;
++
++    if (c->argc != 2 || strcasecmp(c->argv[0]->ptr, "ping")) return;
++    argument = c->argv[1]->ptr;
++    if (strncmp(argument, prefix, sizeof(prefix) - 1) ||
++        !string2ull(argument + sizeof(prefix) - 1, &started))
++    {
++        return;
++    }
++    holSmallPingWaitClient = c;
++    holSmallPingWaitStartedUs = started;
++}
++
++static void holSmallPingWaitProbeFinish(client *c) {
++    uint64_t elapsed;
++
++    if (c != holSmallPingWaitClient) return;
++    holSmallPingWaitClient = NULL;
++    elapsed = getMonotonicUs() - holSmallPingWaitStartedUs;
++    holProbeRecordMax(&holSmallPingWaitProbeFd, &holSmallPingWaitProbeMax,
++                      "PERFLOOP_HOL_SMALL_QUEUE_WAIT_PATH", elapsed);
++}
++#endif
+ static void setProtocolError(const char *errstr, client *c);
+ static void pauseClientsByClient(mstime_t end, int isPauseClientAll);
+ char *getClientSockname(client *c);
+@@ -2786,6 +2840,11 @@ static inline int _writeToClientSlave(client *c, ssize_t *nwritten) {
+  * set to 0. So when handler_installed is set to 0 the function must be
+  * thread safe. */
+ int writeToClient(client *c, int handler_installed) {
++#ifdef PERFLOOP_HOL_CALLBACK_PROBE
++    monotime hol_callback_started __attribute__((cleanup(holCallbackProbeFinish)));
++    elapsedStart(&hol_callback_started);
++    holSmallPingWaitProbeFinish(c);
++#endif
+     if (!(c->io_flags & CLIENT_IO_WRITE_ENABLED)) return C_OK;
+     /* Update the number of writes of io threads on server */
+     atomicIncr(IOThreads[c->running_tid].io_writes_processed, 1);
+@@ -3789,6 +3848,9 @@ int processInputBuffer(client *c) {
+             }
+ 
+             /* We are finally ready to execute the command. */
++#ifdef PERFLOOP_HOL_CALLBACK_PROBE
++            holSmallPingWaitProbeStart(c);
++#endif
+             if (processCommandAndResetClient(c) == C_ERR) {
+                 /* If the client is no longer valid, we avoid exiting this
+                  * loop and trimming the client buffer later. So we return
