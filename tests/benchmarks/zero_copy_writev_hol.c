@@ -5,8 +5,8 @@
  * CLIENT LIST while a transaction holds a large GET reply, then validates the
  * full RESP payload and ordering.  `--measure` runs a continuously draining
  * bulk GET client beside a latency-sensitive PING client.  A tiny LD_PRELOAD
- * helper records the largest successful server writev() result.  The build
- * also applies a test-only timestamp probe around writeToClient() and tags
+ * helper aggregates every successful server writev() result into a histogram.
+ * The build also applies a test-only timestamp probe around writeToClient() and tags
  * each small PING with a client monotonic timestamp, exposing the reply-vector
  * quantum, its event callback span, and server-side small-request wait.
  */
@@ -37,6 +37,8 @@
 #define SERVER_WAIT_ATTEMPTS 500
 #define SERVER_WAIT_NS (10L * 1000L * 1000L)
 #define TIMED_PING_PREFIX "PERFLOOP_HOL:"
+#define WRITEV_TRACE_BUCKET_BYTES 1024U
+#define WRITEV_TRACE_BUCKET_COUNT 8192U
 
 typedef struct serverProcess {
     const char *binary;
@@ -48,6 +50,14 @@ typedef struct serverProcess {
     int port;
     pid_t pid;
 } serverProcess;
+
+typedef struct writevTrace {
+    unsigned long long count;
+    unsigned long long sum;
+    unsigned long long maximum;
+    unsigned long long over_quantum_count;
+    unsigned long long buckets[WRITEV_TRACE_BUCKET_COUNT];
+} writevTrace;
 
 typedef struct bulkWorker {
     int port;
@@ -508,7 +518,7 @@ static int compareLatency(const void *left, const void *right) {
     return a < b ? -1 : a > b;
 }
 
-static int readLargestWritev(const char *path, unsigned long long *largest) {
+static int readLargestValue(const char *path, unsigned long long *largest) {
     FILE *file;
     unsigned long long value;
 
@@ -522,6 +532,78 @@ static int readLargestWritev(const char *path, unsigned long long *largest) {
     }
     fclose(file);
     return *largest > 0 ? 0 : -1;
+}
+
+static int readWritevTrace(const char *path, writevTrace *trace) {
+    char record[32];
+    FILE *file;
+    int saw_count = 0;
+    int saw_sum = 0;
+    int saw_max = 0;
+    int saw_over_quantum = 0;
+
+    file = fopen(path, "r");
+    if (file == NULL)
+        return -1;
+    memset(trace, 0, sizeof(*trace));
+    while (fscanf(file, "%31s", record) == 1) {
+        if (strcmp(record, "count") == 0) {
+            if (fscanf(file, "%llu", &trace->count) != 1)
+                goto error;
+            saw_count = 1;
+        } else if (strcmp(record, "sum") == 0) {
+            if (fscanf(file, "%llu", &trace->sum) != 1)
+                goto error;
+            saw_sum = 1;
+        } else if (strcmp(record, "max") == 0) {
+            if (fscanf(file, "%llu", &trace->maximum) != 1)
+                goto error;
+            saw_max = 1;
+        } else if (strcmp(record, "over_quantum") == 0) {
+            if (fscanf(file, "%llu", &trace->over_quantum_count) != 1)
+                goto error;
+            saw_over_quantum = 1;
+        } else if (strcmp(record, "bucket") == 0) {
+            size_t index;
+            unsigned long long count;
+
+            if (fscanf(file, "%zu %llu", &index, &count) != 2 || index >= WRITEV_TRACE_BUCKET_COUNT)
+                goto error;
+            trace->buckets[index] = count;
+        } else {
+            goto error;
+        }
+    }
+    fclose(file);
+    unsigned long long bucket_total = 0;
+    for (size_t index = 0; index < WRITEV_TRACE_BUCKET_COUNT; index++)
+        bucket_total += trace->buckets[index];
+    return saw_count && saw_sum && saw_max && saw_over_quantum && trace->count > 0 && trace->maximum > 0 &&
+                   bucket_total == trace->count
+               ? 0
+               : -1;
+
+error:
+    fclose(file);
+    return -1;
+}
+
+static unsigned long long writevTraceQuantileUpperBound(const writevTrace *trace, unsigned basis_points) {
+    unsigned long long rank = (trace->count * basis_points + 9999U) / 10000U;
+    unsigned long long accumulated = 0;
+
+    for (size_t index = 0; index < WRITEV_TRACE_BUCKET_COUNT; index++) {
+        accumulated += trace->buckets[index];
+        if (accumulated >= rank) {
+            unsigned long long upper_bound;
+
+            if (index == WRITEV_TRACE_BUCKET_COUNT - 1)
+                return trace->maximum;
+            upper_bound = (unsigned long long)(index + 1) * WRITEV_TRACE_BUCKET_BYTES - 1U;
+            return upper_bound < trace->maximum ? upper_bound : trace->maximum;
+        }
+    }
+    return 0;
 }
 
 static int runVerify(const char *binary) {
@@ -589,6 +671,7 @@ static int runMeasurement(const char *binary, const char *probe, unsigned int du
     unsigned long long largest_callback;
     unsigned long long largest_small_ping_wait;
     unsigned long long quantum_excess;
+    writevTrace write_trace;
     uint64_t deadline;
     int small_fd = -1;
     int thread_started = 0;
@@ -645,10 +728,19 @@ static int runMeasurement(const char *binary, const char *probe, unsigned int du
     after_measure = atomic_load(&worker.completed);
     if (latency_count < 1000 || after_measure <= before_measure || atomic_load(&worker.failed))
         goto cleanup;
-    if (readLargestWritev(server.trace_path, &largest_writev) != 0 ||
-        readLargestWritev(server.callback_trace_path, &largest_callback) != 0 ||
-        readLargestWritev(server.small_ping_wait_trace_path, &largest_small_ping_wait) != 0)
+    atomic_store(&worker.stop, true);
+    pthread_join(worker_thread, NULL);
+    thread_started = 0;
+    close(small_fd);
+    small_fd = -1;
+    stopServer(&server);
+    if (readWritevTrace(server.trace_path, &write_trace) != 0 ||
+        readLargestValue(server.callback_trace_path, &largest_callback) != 0 ||
+        readLargestValue(server.small_ping_wait_trace_path, &largest_small_ping_wait) != 0)
+    {
         goto cleanup;
+    }
+    largest_writev = write_trace.maximum;
 
     qsort(latencies, latency_count, sizeof(*latencies), compareLatency);
     completed_during = after_measure - before_measure;
@@ -656,6 +748,12 @@ static int runMeasurement(const char *binary, const char *probe, unsigned int du
                          largest_writev - EVENT_WRITE_QUANTUM : 0;
     printf("{\"metric\":\"small_ping_p99_us\",\"value\":%.3f}\n",
            latencies[(latency_count * 99 + 99) / 100 - 1]);
+    printf("{\"metric\":\"writev_accepted_bytes_count\",\"value\":%llu}\n", write_trace.count);
+    printf("{\"metric\":\"writev_accepted_bytes_total\",\"value\":%llu}\n", write_trace.sum);
+    printf("{\"metric\":\"writev_accepted_bytes_p99_upper_bound\",\"value\":%llu}\n",
+           writevTraceQuantileUpperBound(&write_trace, 9900));
+    printf("{\"metric\":\"writev_accepted_over_quantum_count\",\"value\":%llu}\n",
+           write_trace.over_quantum_count);
     printf("{\"metric\":\"bulk_writev_max_bytes\",\"value\":%llu}\n", largest_writev);
     printf("{\"metric\":\"bulk_writev_quantum_excess_bytes\",\"value\":%llu}\n", quantum_excess);
     printf("{\"metric\":\"bulk_writev_quantum_excess_callback_byte_us\",\"value\":%llu}\n",
