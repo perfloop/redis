@@ -2463,8 +2463,8 @@ static int replyIOVReachLimit(ReplyIOV *reply_iov) {
     return reply_iov->iovcnt >= reply_iov->iovmax || reply_iov->iov_bytes_len >= NET_MAX_WRITES_PER_EVENT;
 }
 
-/* Add one iovec without exceeding the per-event write quantum. */
-static void replyIOVAdd(ReplyIOV *reply_iov, void *base, size_t len) {
+/* Add one BULK_STR_REF span without exceeding the per-event write quantum. */
+static void replyIOVAddBulkStrRef(ReplyIOV *reply_iov, void *base, size_t len) {
     serverAssert(!replyIOVReachLimit(reply_iov));
     len = min(len, NET_MAX_WRITES_PER_EVENT - reply_iov->iov_bytes_len);
     serverAssert(len > 0);
@@ -2483,8 +2483,9 @@ static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, c
 
         if (head->payload_type == PLAIN_REPLY) {
             /* Plain data - add directly */
-            replyIOVAdd(reply_iov, ptr + sizeof(payloadHeader) + offset,
-                          head->payload_len - offset);
+            reply_iov->iov[reply_iov->iovcnt].iov_base = ptr + sizeof(payloadHeader) + offset;
+            reply_iov->iov[reply_iov->iovcnt].iov_len = head->payload_len - offset;
+            reply_iov->iov_bytes_len += reply_iov->iov[reply_iov->iovcnt++].iov_len;
         } else {
             /* BULK_STR_REF - expand to prefix + string + crlf (format prefix at write time) */
             bulkStrRef *str_ref = (bulkStrRef *)(ptr + sizeof(payloadHeader));
@@ -2494,7 +2495,7 @@ static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, c
             /* Add prefix */
             if (offset < prefix_len) {
                 if (replyIOVReachLimit(reply_iov)) return;
-                replyIOVAdd(reply_iov, str_ref->prefix + offset, prefix_len - offset);
+                replyIOVAddBulkStrRef(reply_iov, str_ref->prefix + offset, prefix_len - offset);
                 offset = 0;
             } else {
                 offset -= prefix_len;
@@ -2503,7 +2504,7 @@ static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, c
             /* Add string data */
             if (offset < str_len) {
                 if (replyIOVReachLimit(reply_iov)) return;
-                replyIOVAdd(reply_iov, (char *)str_ref->obj->ptr + offset, str_len - offset);
+                replyIOVAddBulkStrRef(reply_iov, (char *)str_ref->obj->ptr + offset, str_len - offset);
                 offset = 0;
             } else {
                 offset -= str_len;
@@ -2512,7 +2513,7 @@ static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, c
             /* Add crlf */
             if (offset < 2) {
                 if (replyIOVReachLimit(reply_iov)) return;
-                replyIOVAdd(reply_iov, str_ref->crlf + offset, 2 - offset);
+                replyIOVAddBulkStrRef(reply_iov, str_ref->crlf + offset, 2 - offset);
             }
         }
 
@@ -2582,7 +2583,9 @@ static int _writevToClient(client *c, ssize_t *nwritten) {
     if (c->bufpos > 0) {
         if (likely(!c->buf_encoded)) {
             /* Non-encoded buffer - add directly */
-            replyIOVAdd(&reply_iov, c->buf + c->sentlen, c->bufpos - c->sentlen);
+            iov[reply_iov.iovcnt].iov_base = c->buf + c->sentlen;
+            iov[reply_iov.iovcnt].iov_len = c->bufpos - c->sentlen;
+            reply_iov.iov_bytes_len += iov[reply_iov.iovcnt++].iov_len;
         } else {
             /* Encoded buffer */
             char *start_ptr = c->last_header ? (char *)c->last_header : c->buf;
@@ -2613,7 +2616,9 @@ static int _writevToClient(client *c, ssize_t *nwritten) {
             if (!o->buf_encoded) {
                 serverAssert(!last_header);
                 /* Non-encoded reply block - add directly */
-                replyIOVAdd(&reply_iov, o->buf + offset, o->used - offset);
+                iov[reply_iov.iovcnt].iov_base = o->buf + offset;
+                iov[reply_iov.iovcnt].iov_len = o->used - offset;
+                reply_iov.iov_bytes_len += iov[reply_iov.iovcnt++].iov_len;
                 offset = 0;
             } else {
                 /* Encoded reply block */
