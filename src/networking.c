@@ -33,7 +33,7 @@ char *getClientSockname(client *c);
 static inline int clientTypeIsSlave(client *c);
 static inline int _clientHasPendingRepliesSlave(client *c);
 static inline int _clientHasPendingRepliesNonSlave(client *c);
-static inline int _writeToClientNonSlave(client *c, ssize_t *nwritten, size_t max_bytes);
+static inline int _writeToClientNonSlave(client *c, ssize_t *nwritten);
 static inline int _writeToClientSlave(client *c, ssize_t *nwritten);
 static pendingCommand *acquirePendingCommand(void);
 static inline void reclaimPendingCommand(client *c, pendingCommand *pcmd);
@@ -2458,18 +2458,17 @@ typedef struct ReplyIOV {
     int iovmax;             /* Maximum number of iovec entries allocated */
     int iovcnt;             /* Current number of iovec entries in use */
     size_t iov_bytes_len;   /* Total bytes across all iovec entries */
-    size_t max_bytes;       /* Maximum bytes across all iovec entries */
 } ReplyIOV;
 
 /* Check if the reply IOV has reached its limit yet. */
 static int replyIOVReachLimit(ReplyIOV *reply_iov) {
-    return reply_iov->iovcnt >= reply_iov->iovmax || reply_iov->iov_bytes_len >= reply_iov->max_bytes;
+    return reply_iov->iovcnt >= reply_iov->iovmax || reply_iov->iov_bytes_len >= NET_MAX_WRITES_PER_EVENT;
 }
 
-/* Add one iovec without exceeding the write limit. */
+/* Add one iovec without exceeding the per-event write quantum. */
 static void replyIOVAdd(ReplyIOV *reply_iov, void *base, size_t len) {
     serverAssert(!replyIOVReachLimit(reply_iov));
-    len = min(len, reply_iov->max_bytes - reply_iov->iov_bytes_len);
+    len = min(len, NET_MAX_WRITES_PER_EVENT - reply_iov->iov_bytes_len);
 
     reply_iov->iov[reply_iov->iovcnt].iov_base = base;
     reply_iov->iov[reply_iov->iovcnt].iov_len = len;
@@ -2575,10 +2574,10 @@ static payloadHeader *processSentDataInEncodedBuffer(client *c, char *start_ptr,
  * If we write successfully, it returns C_OK, otherwise, C_ERR is returned,
  * and 'nwritten' is an output parameter, it means how many bytes server write
  * to client. */
-static int _writevToClient(client *c, ssize_t *nwritten, size_t max_bytes) {
+static int _writevToClient(client *c, ssize_t *nwritten) {
     int iovmax = min(IOV_MAX, c->conn->iovcnt);
     struct iovec iov[iovmax];
-    ReplyIOV reply_iov = {iov, iovmax, 0, 0, max_bytes};
+    ReplyIOV reply_iov = {iov, iovmax, 0, 0};
 
     /* Add c->buf to iov array */
     if (c->bufpos > 0) {
@@ -2698,12 +2697,12 @@ static int _writevToClient(client *c, ssize_t *nwritten, size_t max_bytes) {
  * If we write successfully, it returns C_OK, otherwise, C_ERR is returned,
  * and 'nwritten' is an output parameter, it means how many bytes server write
  * to client. */
-static inline int _writeToClientNonSlave(client *c, ssize_t *nwritten, size_t max_bytes) {
+static inline int _writeToClientNonSlave(client *c, ssize_t *nwritten) {
     *nwritten = 0;
     /* When the reply list is not empty, it's better to use writev to save us some
      * system calls and TCP packets. */
     if (listLength(c->reply) > 0) {
-        int ret = _writevToClient(c, nwritten, max_bytes);
+        int ret = _writevToClient(c, nwritten);
         if (ret != C_OK) return ret;
 
         /* If there are no longer objects in the list, we expect
@@ -2713,7 +2712,7 @@ static inline int _writeToClientNonSlave(client *c, ssize_t *nwritten, size_t ma
     } else if (c->bufpos > 0) {
         /* For encoded buffers, we need to use writev to handle bulk string references */
         if (c->buf_encoded) {
-            int ret = _writevToClient(c, nwritten, max_bytes);
+            int ret = _writevToClient(c, nwritten);
             return ret;
         }
 
@@ -2811,15 +2810,8 @@ int writeToClient(client *c, int handler_installed) {
          * it's because it's a MONITOR/slot-migration client, which are marked
          * as replicas, but exposed as normal clients */
         const int is_normal_client = !(c->flags & CLIENT_SLAVE);
-        /* Always yield once after a new reply starts. Continue bounding an
-         * incomplete reply only while another client can contend for this
-         * event loop; otherwise let the sole client drain its remainder. */
-        size_t max_bytes = c->sentlen == 0 ||
-                           (c->running_tid == IOTHREAD_MAIN_THREAD_ID &&
-                            listLength(server.clients) > 1) ?
-                           NET_MAX_WRITES_PER_EVENT : SIZE_MAX;
         while (_clientHasPendingRepliesNonSlave(c)) {
-            int ret = _writeToClientNonSlave(c, &nwritten, max_bytes);
+            int ret = _writeToClientNonSlave(c, &nwritten);
             if (ret == C_ERR) break;
             totwritten += nwritten;
             /* Note that we avoid to send more than NET_MAX_WRITES_PER_EVENT
