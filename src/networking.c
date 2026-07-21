@@ -2814,23 +2814,18 @@ int writeToClient(client *c, int handler_installed) {
             int ret = _writeToClientNonSlave(c, &nwritten);
             if (ret == C_ERR) break;
             totwritten += nwritten;
-            /* Note that we avoid to send more than NET_MAX_WRITES_PER_EVENT
-             * bytes, in a single threaded server it's a good idea to serve
-             * other clients as well, even if a very large request comes from
-             * super fast link that is always able to accept data (in real world
-             * scenario think about 'KEYS *' against the loopback interface).
-             *
-             * However if we are over the maxmemory limit we ignore that and
-             * just deliver as much data as it is possible to deliver.
-             *
-             * Moreover, we also send as much as possible if the client is
-             * a slave (covered above) or a monitor (covered here).
-             * (otherwise, on high-speed traffic, the
-             * output buffer will grow indefinitely) */
+            /* Each gathered vector is capped at NET_MAX_WRITES_PER_EVENT.
+             * Normal clients yield after one vector when another client can
+             * share this lane; a sole main-thread normal client may submit
+             * another capped vector to avoid an otherwise idle event-loop turn.
+             * Normal clients on output I/O workers always yield because their
+             * assigned clients share a worker. */
             if (totwritten >= NET_MAX_WRITES_PER_EVENT &&
                 (server.maxmemory == 0 ||
                 zmalloc_used_memory() < server.maxmemory) &&
-                is_normal_client) break;
+                is_normal_client &&
+                (c->running_tid != IOTHREAD_MAIN_THREAD_ID ||
+                 listLength(server.clients) > 1)) break;
         }
         atomicIncr(server.stat_net_output_bytes, totwritten);
     }
