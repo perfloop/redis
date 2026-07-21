@@ -282,6 +282,77 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         }
     }
 
+    test "copy-avoided bulk reply preserves a following empty bulk reply" {
+        r flushdb
+        r debug reply-copy-avoidance 1
+        set large [string repeat x [expr {4 * 1024 * 1024}]]
+        r set large $large
+        r set empty {}
+
+        # Send both GETs in one request stream. The first response must cross
+        # the per-event write quantum before the empty bulk response resumes.
+        set rd [redis_deferring_client]
+        set request "*2\r\n\$3\r\nGET\r\n\$5\r\nlarge\r\n"
+        append request "*2\r\n\$3\r\nGET\r\n\$5\r\nempty\r\n"
+        $rd write $request
+        $rd flush
+
+        assert_equal $large [$rd read]
+        assert_equal {} [$rd read]
+        $rd ping
+        assert_equal PONG [$rd read]
+        $rd close
+    } {} {needs:debug}
+
+    test "copy-avoided bulk prefix and terminator resume at the write quantum" {
+        r flushdb
+        r debug reply-copy-avoidance 1
+        set crlf_value [string repeat c 65527]
+        set first_value [string repeat a 65523]
+        set second_value [string repeat b 65523]
+        r set crlf $crlf_value
+        r set first $first_value
+        r set second $second_value
+
+        set rd [redis_deferring_client]
+        # The prefix plus this value leaves one byte for the CRLF, so the
+        # terminator must resume in a later write.
+        $rd write "*2\r\n\$3\r\nGET\r\n\$4\r\ncrlf\r\n*1\r\n\$4\r\nPING\r\n"
+        $rd flush
+        assert_equal $crlf_value [$rd read]
+        assert_equal PONG [$rd read]
+
+        # The first reply leaves three bytes in the quantum. The next bulk
+        # prefix therefore resumes after those three bytes.
+        $rd write "*2\r\n\$3\r\nGET\r\n\$5\r\nfirst\r\n*2\r\n\$3\r\nGET\r\n\$6\r\nsecond\r\n*1\r\n\$4\r\nPING\r\n"
+        $rd flush
+        assert_equal $first_value [$rd read]
+        assert_equal $second_value [$rd read]
+        assert_equal PONG [$rd read]
+        $rd close
+    } {} {needs:debug}
+
+    test "copied bulk reply preserves a following empty bulk reply" {
+        r flushdb
+        r debug reply-copy-avoidance 0
+        set large [string repeat y [expr {4 * 1024 * 1024}]]
+        r set large $large
+        r set empty {}
+
+        set rd [redis_deferring_client]
+        set request "*2\r\n\$3\r\nGET\r\n\$5\r\nlarge\r\n"
+        append request "*2\r\n\$3\r\nGET\r\n\$5\r\nempty\r\n"
+        $rd write $request
+        $rd flush
+
+        assert_equal $large [$rd read]
+        assert_equal {} [$rd read]
+        $rd ping
+        assert_equal PONG [$rd read]
+        $rd close
+        r debug reply-copy-avoidance 1
+    } {} {needs:debug}
+
     test "shared reply bytes are tracked as unshared after the key is deleted" {
         r flushdb
         r config set client-output-buffer-limit {normal 0 0 0}
