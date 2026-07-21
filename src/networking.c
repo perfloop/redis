@@ -2815,17 +2815,19 @@ int writeToClient(client *c, int handler_installed) {
             if (ret == C_ERR) break;
             totwritten += nwritten;
             /* Each gathered vector is capped at NET_MAX_WRITES_PER_EVENT.
-             * Normal clients yield after one vector when another client can
-             * share this lane; a sole main-thread normal client may submit
-             * another capped vector to avoid an otherwise idle event-loop turn.
-             * Normal clients on output I/O workers always yield because their
-             * assigned clients share a worker. */
+             * Outside the existing maxmemory-pressure override, normal-client
+             * scheduling yields after one vector when another client can share
+             * this lane. A sole main-thread client may send a bounded
+             * four-quantum batch, then returns so a newly arriving peer can be
+             * accepted. In that policy, output I/O workers always yield after
+             * one vector because their assigned clients share a worker. */
             if (totwritten >= NET_MAX_WRITES_PER_EVENT &&
                 (server.maxmemory == 0 ||
                 zmalloc_used_memory() < server.maxmemory) &&
                 is_normal_client &&
                 (c->running_tid != IOTHREAD_MAIN_THREAD_ID ||
-                 listLength(server.clients) > 1)) break;
+                 listLength(server.clients) > 1 ||
+                 totwritten >= NET_MAX_WRITES_PER_EVENT * 4)) break;
         }
         atomicIncr(server.stat_net_output_bytes, totwritten);
     }
