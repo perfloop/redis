@@ -140,23 +140,22 @@ class RedisServer:
         self.proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         log.close()
 
-        deadline = time.monotonic() + 10
         last_error = None
-        while time.monotonic() < deadline:
+        while self.proc.poll() is None:
             try:
-                client = self.connect(timeout=0.2)
+                client = self.connect()
                 client.send("PING")
                 client.expect_simple(b"+PONG")
                 return client
             except (OSError, ProtocolError) as exc:
                 last_error = exc
                 time.sleep(0.02)
-        raise RuntimeError("Redis did not become ready: %s" % last_error)
+        raise RuntimeError("Redis exited before it became ready: %s" % last_error)
 
-    def connect(self, timeout=10):
-        sock = socket.create_connection(("127.0.0.1", self.port), timeout=timeout)
+    def connect(self):
+        sock = socket.create_connection(("127.0.0.1", self.port))
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.settimeout(timeout)
+        sock.setblocking(True)
         client = RedisClient(sock)
         self.clients.append(client)
         return client
