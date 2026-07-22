@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Measure the reply-output shared-lane workload with live Redis sockets."""
+"""Measure Redis's native benchmark clients on the reply-output shared lane."""
 
 import argparse
+import csv
+import io
 import json
-import math
 import os
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
 VALUE_BYTES = 4 * 1024 * 1024
 VALUE_BYTE = b"x"
-PING_SAMPLES = 240
-CONTENDED_BULK_REPLIES = 48
+PING_REQUESTS = 50000
+BULK_REQUESTS = 1000000
 
 
 class ProtocolError(RuntimeError):
@@ -70,9 +70,7 @@ class RedisClient:
             self.buffer.extend(chunk)
 
     def expect_simple(self, expected):
-        kind = self._read_exact(1)
-        value = self._read_line()
-        actual = kind + value
+        actual = self._read_exact(1) + self._read_line()
         if actual != expected:
             raise ProtocolError("expected %r, got %r" % (expected, actual))
 
@@ -200,65 +198,64 @@ def with_server(io_threads, body):
         server.close()
 
 
-def percentile_99(values):
-    if not values:
-        raise RuntimeError("no ping samples")
-    ordered = sorted(values)
-    return ordered[math.ceil(len(ordered) * 0.99) - 1]
+def native_contended_ping_p99():
+    def run(server, setup_client):
+        server.prepare_large_values(setup_client)
+        setup_client.close()
 
-
-def measure_contended_ping_p99():
-    def run(server, bulk):
-        server.prepare_large_values(bulk)
-        pinger = server.connect()
-        pinger.send("PING")
-        pinger.expect_simple(b"+PONG")
-
-        first_bulk_reply = threading.Event()
-        drain_bulk_replies = threading.Event()
-        worker_error = []
-
-        def bulk_worker():
+        bulk_command = [
+            "./src/redis-benchmark",
+            "-p",
+            str(server.port),
+            "-n",
+            str(BULK_REQUESTS),
+            "-c",
+            "1",
+            "-P",
+            "1",
+            "-q",
+            "GET",
+            "reply-iov-large",
+        ]
+        ping_command = [
+            "./src/redis-benchmark",
+            "-p",
+            str(server.port),
+            "-n",
+            str(PING_REQUESTS),
+            "-c",
+            "1",
+            "-P",
+            "1",
+            "--csv",
+            "PING",
+        ]
+        bulk = subprocess.Popen(bulk_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            ping = subprocess.run(ping_command, capture_output=True, text=True, timeout=90, check=False)
+        finally:
+            bulk_was_running = bulk.poll() is None
+            if bulk_was_running:
+                bulk.terminate()
             try:
-                for _ in range(CONTENDED_BULK_REPLIES):
-                    bulk.send("GET", "reply-iov-large")
-                first_size = bulk.read_bulk_header()
-                if first_size != VALUE_BYTES:
-                    raise ProtocolError("unexpected first bulk size %d" % first_size)
-                first_byte = bulk._read_exact(1)
-                if first_byte != VALUE_BYTE:
-                    raise ProtocolError("unexpected first bulk byte")
-                first_bulk_reply.set()
-                if not drain_bulk_replies.wait(timeout=10):
-                    raise RuntimeError("pinger did not start")
-                bulk.read_bulk_body(first_size - 1)
-                for _ in range(CONTENDED_BULK_REPLIES - 1):
-                    bulk.read_bulk(VALUE_BYTES)
-            except BaseException as exc:
-                worker_error.append(exc)
-                first_bulk_reply.set()
+                _, bulk_stderr = bulk.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                bulk.kill()
+                _, bulk_stderr = bulk.communicate(timeout=10)
 
-        worker = threading.Thread(target=bulk_worker, daemon=True)
-        worker.start()
-        if not first_bulk_reply.wait(timeout=10):
-            raise RuntimeError("copy-avoided bulk stream did not begin")
-        if worker_error:
-            raise worker_error[0]
-
-        drain_bulk_replies.set()
-        latencies_us = []
-        for _ in range(PING_SAMPLES):
-            before = time.perf_counter_ns()
-            pinger.send("PING")
-            pinger.expect_simple(b"+PONG")
-            latencies_us.append((time.perf_counter_ns() - before) / 1000.0)
-
-        worker.join(timeout=20)
-        if worker.is_alive():
-            raise RuntimeError("bulk worker did not finish")
-        if worker_error:
-            raise worker_error[0]
-        return percentile_99(latencies_us)
+        if ping.returncode != 0:
+            raise RuntimeError("native PING benchmark failed: %s" % ping.stderr.strip())
+        if not bulk_was_running:
+            raise RuntimeError("native bulk GET stream ended before the PING sample completed")
+        if bulk.returncode not in (-15, 0):
+            raise RuntimeError("native bulk benchmark failed: %s" % bulk_stderr.strip())
+        rows = list(csv.DictReader(io.StringIO(ping.stdout)))
+        if len(rows) != 1 or rows[0].get("test") != "PING":
+            raise RuntimeError("unexpected native PING benchmark output: %r" % ping.stdout)
+        try:
+            return float(rows[0]["p99_latency_ms"]) * 1000.0
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError("native PING benchmark omitted p99: %r" % ping.stdout) from exc
 
     return with_server(1, run)
 
@@ -284,7 +281,7 @@ def main():
     if args.mode == "contended":
         print(
             json.dumps(
-                {"metric": "contended_ping_p99_us", "value": measure_contended_ping_p99()},
+                {"metric": "contended_ping_p99_us", "value": native_contended_ping_p99()},
                 separators=(",", ":"),
             ),
             flush=True,
