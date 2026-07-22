@@ -2463,6 +2463,18 @@ static int replyIOVReachLimit(ReplyIOV *reply_iov) {
     return reply_iov->iovcnt >= reply_iov->iovmax || reply_iov->iov_bytes_len >= NET_MAX_WRITES_PER_EVENT;
 }
 
+/* Append no more than this write event's remaining byte budget to the IOV. */
+static void replyIOVAppend(ReplyIOV *reply_iov, void *base, size_t len) {
+    serverAssert(!replyIOVReachLimit(reply_iov));
+    size_t remaining = NET_MAX_WRITES_PER_EVENT - reply_iov->iov_bytes_len;
+    size_t iov_len = min(len, remaining);
+
+    reply_iov->iov[reply_iov->iovcnt].iov_base = base;
+    reply_iov->iov[reply_iov->iovcnt].iov_len = iov_len;
+    reply_iov->iov_bytes_len += iov_len;
+    reply_iov->iovcnt++;
+}
+
 /* Helper function to process encoded buffer and build iov array. */
 static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, char *end_ptr, size_t offset) {
     char *ptr = start_ptr;
@@ -2471,9 +2483,8 @@ static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, c
 
         if (head->payload_type == PLAIN_REPLY) {
             /* Plain data - add directly */
-            reply_iov->iov[reply_iov->iovcnt].iov_base = ptr + sizeof(payloadHeader) + offset;
-            reply_iov->iov[reply_iov->iovcnt].iov_len = head->payload_len - offset;
-            reply_iov->iov_bytes_len += reply_iov->iov[reply_iov->iovcnt++].iov_len;
+            replyIOVAppend(reply_iov, ptr + sizeof(payloadHeader) + offset,
+                           head->payload_len - offset);
         } else {
             /* BULK_STR_REF - expand to prefix + string + crlf (format prefix at write time) */
             bulkStrRef *str_ref = (bulkStrRef *)(ptr + sizeof(payloadHeader));
@@ -2483,9 +2494,7 @@ static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, c
             /* Add prefix */
             if (offset < prefix_len) {
                 if (replyIOVReachLimit(reply_iov)) return;
-                reply_iov->iov[reply_iov->iovcnt].iov_base = str_ref->prefix + offset;
-                reply_iov->iov[reply_iov->iovcnt].iov_len = prefix_len - offset;
-                reply_iov->iov_bytes_len += reply_iov->iov[reply_iov->iovcnt++].iov_len;
+                replyIOVAppend(reply_iov, str_ref->prefix + offset, prefix_len - offset);
                 offset = 0;
             } else {
                 offset -= prefix_len;
@@ -2494,9 +2503,7 @@ static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, c
             /* Add string data */
             if (offset < str_len) {
                 if (replyIOVReachLimit(reply_iov)) return;
-                reply_iov->iov[reply_iov->iovcnt].iov_base = (char *)str_ref->obj->ptr + offset;
-                reply_iov->iov[reply_iov->iovcnt].iov_len = str_len - offset;
-                reply_iov->iov_bytes_len += reply_iov->iov[(reply_iov->iovcnt)++].iov_len;
+                replyIOVAppend(reply_iov, (char *)str_ref->obj->ptr + offset, str_len - offset);
                 offset = 0;
             } else {
                 offset -= str_len;
@@ -2505,9 +2512,7 @@ static void processEncodedBufferForWrite(ReplyIOV *reply_iov, char *start_ptr, c
             /* Add crlf */
             if (offset < 2) {
                 if (replyIOVReachLimit(reply_iov)) return;
-                reply_iov->iov[reply_iov->iovcnt].iov_base = str_ref->crlf + offset;
-                reply_iov->iov[reply_iov->iovcnt].iov_len = 2 - offset;
-                reply_iov->iov_bytes_len += reply_iov->iov[reply_iov->iovcnt++].iov_len;
+                replyIOVAppend(reply_iov, str_ref->crlf + offset, 2 - offset);
             }
         }
 
@@ -2577,9 +2582,7 @@ static int _writevToClient(client *c, ssize_t *nwritten) {
     if (c->bufpos > 0) {
         if (likely(!c->buf_encoded)) {
             /* Non-encoded buffer - add directly */
-            iov[reply_iov.iovcnt].iov_base = c->buf + c->sentlen;
-            iov[reply_iov.iovcnt].iov_len = c->bufpos - c->sentlen;
-            reply_iov.iov_bytes_len += iov[reply_iov.iovcnt++].iov_len;
+            replyIOVAppend(&reply_iov, c->buf + c->sentlen, c->bufpos - c->sentlen);
         } else {
             /* Encoded buffer */
             char *start_ptr = c->last_header ? (char *)c->last_header : c->buf;
@@ -2610,9 +2613,7 @@ static int _writevToClient(client *c, ssize_t *nwritten) {
             if (!o->buf_encoded) {
                 serverAssert(!last_header);
                 /* Non-encoded reply block - add directly */
-                iov[reply_iov.iovcnt].iov_base = o->buf + offset;
-                iov[reply_iov.iovcnt].iov_len = o->used - offset;
-                reply_iov.iov_bytes_len += iov[reply_iov.iovcnt++].iov_len;
+                replyIOVAppend(&reply_iov, o->buf + offset, o->used - offset);
                 offset = 0;
             } else {
                 /* Encoded reply block */
@@ -2808,23 +2809,23 @@ int writeToClient(client *c, int handler_installed) {
          * it's because it's a MONITOR/slot-migration client, which are marked
          * as replicas, but exposed as normal clients */
         const int is_normal_client = !(c->flags & CLIENT_SLAVE);
+        /* Only the main thread can inspect these global lists. A normal client
+         * can submit one more capped vector when it has no peer to delay and no
+         * other client is queued for output. */
+        const int can_continue = is_normal_client &&
+            c->running_tid == IOTHREAD_MAIN_THREAD_ID &&
+            listLength(server.clients) == 1 &&
+            listLength(server.clients_pending_write) == 0;
         while (_clientHasPendingRepliesNonSlave(c)) {
             int ret = _writeToClientNonSlave(c, &nwritten);
             if (ret == C_ERR) break;
             totwritten += nwritten;
-            /* Note that we avoid to send more than NET_MAX_WRITES_PER_EVENT
-             * bytes, in a single threaded server it's a good idea to serve
-             * other clients as well, even if a very large request comes from
-             * super fast link that is always able to accept data (in real world
-             * scenario think about 'KEYS *' against the loopback interface).
-             *
-             * However if we are over the maxmemory limit we ignore that and
-             * just deliver as much data as it is possible to deliver.
-             *
-             * Moreover, we also send as much as possible if the client is
-             * a slave (covered above) or a monitor (covered here).
-             * (otherwise, on high-speed traffic, the
-             * output buffer will grow indefinitely) */
+            /* The IOV itself is capped at NET_MAX_WRITES_PER_EVENT. On a
+             * contended main-thread lane or in an I/O thread, return after one
+             * submission so the event loop can service the peer. A lone normal
+             * client can submit the next capped vector; retain the existing
+             * maxmemory escape hatch and the unrestricted monitor behavior. */
+            if (is_normal_client && !can_continue) break;
             if (totwritten > NET_MAX_WRITES_PER_EVENT &&
                 (server.maxmemory == 0 ||
                 zmalloc_used_memory() < server.maxmemory) &&
