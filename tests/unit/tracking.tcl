@@ -539,11 +539,13 @@ start_server {tags {"tracking network logreqres:skip"}} {
         # otherwise the test will die for timeout.
         while 1 {
             set keys [lindex [$rd_redirection read] 2]
-            if {$keys eq {key1{t}} || $keys eq {key2{t}}} break
+            if {[lsearch -exact $keys {key1{t}}] >= 0 ||
+                [lsearch -exact $keys {key2{t}}] >= 0} break
         }
         # We should receive an expire notification for one of
         # the two keys (only one must remain)
-        assert {$keys eq {key1{t}} || $keys eq {key2{t}}}
+        assert {[lsearch -exact $keys {key1{t}}] >= 0 ||
+                [lsearch -exact $keys {key2{t}}] >= 0}
     }
 
     test {Invalidation message received for flushall} {
@@ -606,12 +608,44 @@ start_server {tags {"tracking network logreqres:skip"}} {
             r GET key$i
         }
         r config set tracking-table-max-keys $TRACKING_TABLE_MAX_KEYS
-        # If not enough keys are evicted, we won't get enough invalidation
-        # messages, and "$rd_redirection read" will block.
-        # If too many keys are evicted, we will get too many invalidation
-        # messages, and the assert will fail.
-        for {set i 0} {$i < $NUM_OF_KEYS_TO_TEST - $TRACKING_TABLE_MAX_KEYS} {incr i} {
-            $rd_redirection read
+        # Eviction batches several keys in each message. Check the complete
+        # key set, not the number of messages.
+        set invalidated {}
+        set frames 0
+        while {[llength $invalidated] < $NUM_OF_KEYS_TO_TEST - $TRACKING_TABLE_MAX_KEYS} {
+            set message [$rd_redirection read]
+            set keys [lindex $message 2]
+            assert {[llength $keys] > 0}
+            lappend invalidated {*}$keys
+            incr frames
+        }
+        assert {[llength $invalidated] == $NUM_OF_KEYS_TO_TEST - $TRACKING_TABLE_MAX_KEYS}
+        assert {[llength [lsort -unique $invalidated]] == [llength $invalidated]}
+        assert {$frames < [llength $invalidated]}
+        $rd_redirection PING
+        assert {[$rd_redirection read] eq {pong {}}}
+    }
+
+    test {Oversized eviction keys use single-key invalidations} {
+        clean_all
+        r CLIENT TRACKING on REDIRECT $redir_id
+        set tracked {}
+        for {set i 0} {$i < 10} {incr i} {
+            set key "[string repeat x 17000]:$i"
+            lappend tracked $key
+            $rd_sg SET $key 1
+            r GET $key
+        }
+        r config set tracking-table-max-keys 1
+        set invalidated {}
+        while {[llength $invalidated] < 9} {
+            set keys [lindex [$rd_redirection read] 2]
+            assert {[llength $keys] == 1}
+            lappend invalidated [lindex $keys 0]
+        }
+        assert {[llength [lsort -unique $invalidated]] == 9}
+        foreach key $invalidated {
+            assert {[lsearch -exact $tracked $key] >= 0}
         }
         $rd_redirection PING
         assert {[$rd_redirection read] eq {pong {}}}

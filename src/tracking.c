@@ -355,23 +355,81 @@ void trackingRememberKeyToBroadcast(client *c, char *keyname, size_t keylen) {
     raxStop(&ri);
 }
 
-/* This function is called from keyModified() or other places in Redis
- * when a key changes value. In the context of keys tracking, our task here is
- * to send a notification to every client that may have keys about such caching
- * slot.
- *
- * Note that 'c' may be NULL in case the operation was performed outside the
- * context of a client modifying the database (for instance when we delete a
- * key because of expire).
- *
- * The last argument 'bcast' tells the function if it should also schedule
- * the key for broadcasting to clients in BCAST mode. This is the case when
- * the function is called from the Redis core once a key is modified, however
- * we also call the function in order to evict keys in the key table in case
- * of memory pressure: in that case the key didn't really change, so we want
- * just to notify the clients that are in the table for this key, that would
- * otherwise miss the fact we are no longer tracking the key for them. */
-void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
+/* Eviction can remove many tracked keys in one sweep. Keep one bounded RESP
+ * array per logical tracking client, while ordinary changes send immediately. */
+typedef struct trackingEvictionBatch {
+    sds body;
+    size_t count;
+} trackingEvictionBatch;
+
+static void trackingEvictionBatchDestructor(dict *d, void *value) {
+    UNUSED(d);
+    trackingEvictionBatch *batch = value;
+    sdsfree(batch->body);
+    zfree(batch);
+}
+
+static void trackingSendEvictionBatch(client *target, trackingEvictionBatch *batch) {
+    if (batch->count == 0) return;
+
+    char buf[32];
+    size_t len = ll2string(buf,sizeof(buf),batch->count);
+    sds proto = sdsempty();
+    proto = sdsMakeRoomFor(proto,1+len+2+sdslen(batch->body));
+    proto = sdscatlen(proto,"*",1);
+    proto = sdscatlen(proto,buf,len);
+    proto = sdscatlen(proto,"\r\n",2);
+    proto = sdscatsds(proto,batch->body);
+    sendTrackingMessage(target,proto,sdslen(proto),1);
+    sdsfree(proto);
+    sdsclear(batch->body);
+    batch->count = 0;
+}
+
+static void trackingQueueEvictionKey(dict *batches, client *target,
+                                     unsigned char *key, size_t keylen)
+{
+    char buf[32];
+    size_t len = ll2string(buf,sizeof(buf),keylen);
+    size_t entry_len = 1+len+2+keylen+2;
+    if (entry_len > PROTO_REPLY_CHUNK_BYTES) {
+        dictEntry *de = dictFind(batches,target);
+        if (de) trackingSendEvictionBatch(target,dictGetVal(de));
+        sendTrackingMessage(target,(char *)key,keylen,0);
+        return;
+    }
+
+    dictEntry *existing;
+    dictEntry *de = dictAddRaw(batches,target,&existing);
+    trackingEvictionBatch *batch;
+    if (de != NULL) {
+        batch = zmalloc(sizeof(*batch));
+        batch->body = sdsempty();
+        batch->count = 0;
+        dictSetVal(batches,de,batch);
+    } else {
+        batch = dictGetVal(existing);
+    }
+
+    if (batch->count &&
+        sdslen(batch->body)+entry_len > PROTO_REPLY_CHUNK_BYTES)
+    {
+        trackingSendEvictionBatch(target,batch);
+    }
+    batch->body = sdsMakeRoomFor(batch->body,entry_len);
+    batch->body = sdscatlen(batch->body,"$",1);
+    batch->body = sdscatlen(batch->body,buf,len);
+    batch->body = sdscatlen(batch->body,"\r\n",2);
+    batch->body = sdscatlen(batch->body,key,keylen);
+    batch->body = sdscatlen(batch->body,"\r\n",2);
+    batch->count++;
+}
+
+/* Remove one tracked key. A non-NULL batches map defers only eviction pushes;
+ * the current client's reply-order queue remains unchanged. */
+static void trackingInvalidateKeyWithBatches(client *c, robj *keyobj,
+                                            int bcast, dict *batches)
+{
     if (TrackingTable == NULL) return;
 
     unsigned char *key = (unsigned char*)keyobj->ptr;
@@ -417,6 +475,8 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
         if (target == server.current_client && (server.current_client->flags & CLIENT_EXECUTING_COMMAND)) {
             incrRefCount(keyobj);
             listAddNodeTail(server.tracking_pending_keys, keyobj);
+        } else if (batches) {
+            trackingQueueEvictionKey(batches,target,key,keylen);
         } else {
             sendTrackingMessage(target,(char *)keyobj->ptr,sdslen(keyobj->ptr),0);
         }
@@ -428,6 +488,13 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
     TrackingTableTotalItems -= raxSize(ids);
     raxFree(ids);
     raxRemove(TrackingTable,(unsigned char*)key,keylen,NULL);
+}
+
+/* Notify trackers when a key changes or its tracking entry is evicted.
+ * c may be NULL outside a client command. bcast also schedules BCAST clients
+ * for real changes, but not tracking-table capacity evictions. */
+void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
+    trackingInvalidateKeyWithBatches(c,keyobj,bcast,NULL);
 }
 
 void trackingHandlePendingKeyInvalidations(void) {
@@ -529,6 +596,10 @@ void trackingLimitUsedSlots(void) {
      * function and found that we are still over the limit. */
     int effort = 100 * (timeout_counter+1);
 
+    dictType dt = { .hashFunction = dictPtrHash,
+                    .valDestructor = trackingEvictionBatchDestructor };
+    dict *batches = dictCreate(&dt);
+
     /* We just remove one key after another by using a random walk. */
     raxIterator ri;
     raxStart(&ri,TrackingTable);
@@ -538,19 +609,26 @@ void trackingLimitUsedSlots(void) {
         raxRandomWalk(&ri,0);
         if (raxEOF(&ri)) break;
         robj *keyobj = createStringObject((char*)ri.key,ri.key_len);
-        trackingInvalidateKey(NULL,keyobj,0);
+        trackingInvalidateKeyWithBatches(NULL,keyobj,0,batches);
         decrRefCount(keyobj);
         if (raxSize(TrackingTable) <= max_keys) {
             timeout_counter = 0;
-            raxStop(&ri);
-            return; /* Return ASAP: we are again under the limit. */
+            break;
         }
     }
 
-    /* If we reach this point, we were not able to go under the configured
-     * limit using the maximum effort we had for this run. */
     raxStop(&ri);
-    timeout_counter++;
+    dictIterator di;
+    dictEntry *de;
+    dictInitIterator(&di,batches);
+    while ((de = dictNext(&di)) != NULL)
+        trackingSendEvictionBatch(dictGetKey(de),dictGetVal(de));
+    dictResetIterator(&di);
+    dictRelease(batches);
+
+    /* Increase the next sweep's effort only if this sweep did not reach
+     * the configured limit. */
+    if (raxSize(TrackingTable) > max_keys) timeout_counter++;
 }
 
 /* Build the RESP array of invalidated key names in 'keys', filtered by:
